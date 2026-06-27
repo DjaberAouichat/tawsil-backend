@@ -1,0 +1,425 @@
+import crypto from "crypto"
+import { getPool, withTransaction, exec } from "../lib/db.js"
+import { findDriverByUserId } from "../models/driver.model.js"
+import {
+  countAvailableTrips,
+  createTrip as createTripRecord,
+  findTripById,
+  listAvailableTrips as listAvailableTripRecords,
+  listDriverTrips as listDriverTripRecords,
+  updateTripStatus as updateTripStatusRecord,
+} from "../models/trip.model.js"
+import { sendSuccess, createError } from "../utils/response.js"
+import { getRequestBaseUrl, toBoundedPositiveInteger } from "../utils/helpers.js"
+import { createNotification } from "../utils/notification.utils.js"
+import {
+  loadTripPrintContext,
+  generateTripPdfBuffer,
+  sendPdfInline,
+} from "../utils/pdf.utils.js"
+import { distanceMeters as haversineDistance } from "../utils/maps.js"
+
+const buildTripPdfUrl = (req, tripId) => {
+  return `${getRequestBaseUrl(req)}/api/trips/${tripId}/pdf`
+}
+
+const DEFAULT_DELIVERIES_PAGE = 1
+const DEFAULT_DELIVERIES_LIMIT = 20
+const MAX_DELIVERIES_LIMIT = 100
+const DEFAULT_AVAILABLE_TRIPS_PAGE = 1
+const DEFAULT_AVAILABLE_TRIPS_LIMIT = 20
+const MAX_AVAILABLE_TRIPS_LIMIT = 100
+
+const toOptionalDate = (value) => {
+  if (!value) {
+    return null
+  }
+
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString()
+}
+
+const withTripMeta = (trip) => ({
+  ...trip,
+  acceptsDeliveries: ["planned", "active"].includes(trip.status) && Number(trip.availableCapacity || 0) > 0,
+})
+
+const extractWilaya = (address) => {
+  if (!address) return ""
+  const parts = address.split(",").map((s) => s.trim()).filter(Boolean)
+  return parts.length > 0 ? parts[parts.length - 1].toLowerCase() : ""
+}
+
+const addressesMatch = (addr1, addr2) => {
+  if (!addr1 || !addr2) return false
+  const wilaya1 = extractWilaya(addr1)
+  const wilaya2 = extractWilaya(addr2)
+  if (wilaya1 && wilaya2 && wilaya1 === wilaya2) return true
+  const words1 = addr1.toLowerCase().split(/[\s,]+/).filter((w) => w.length > 3)
+  const words2 = addr2.toLowerCase().split(/[\s,]+/).filter((w) => w.length > 3)
+  return words1.some((w) => words2.includes(w))
+}
+
+const notifyCompatibleDeliverySenders = async (trip) => {
+  try {
+    const pickupAddress = trip.origin?.address || ""
+    const dropoffAddress = trip.destination?.address || ""
+
+    if (!pickupAddress || !dropoffAddress) return
+
+    const pendingDeliveries = await exec(
+      null,
+      `SELECT d.id, d.requester_id, d.status,
+              pl.address AS pickup_address,
+              dl.address AS dropoff_address
+       FROM Deliveries d
+       LEFT JOIN DeliveryLocations pl ON pl.delivery_id = d.id AND pl.type = 'PICKUP'
+       LEFT JOIN DeliveryLocations dl ON dl.delivery_id = d.id AND dl.type = 'DROPOFF'
+       WHERE d.status = 'Pending'
+       ORDER BY d.created_at DESC`,
+    )
+
+    for (const delivery of pendingDeliveries) {
+      const delPickup = delivery.pickup_address || ""
+      const delDropoff = delivery.dropoff_address || ""
+
+      if (addressesMatch(pickupAddress, delPickup) && addressesMatch(dropoffAddress, delDropoff)) {
+        createNotification({
+          recipient: delivery.requester_id,
+          title: "Conducteur disponible trouvé",
+          message: "Un conducteur effectue un trajet compatible avec votre livraison.",
+          type: "trip_match",
+          reference: trip.id,
+          referenceModel: "Trip",
+          deliveryId: delivery.id,
+          tripId: trip.id,
+          sendEmail: false,
+        }).catch((err) => console.error("[trip] Failed to send match notification:", err))
+      }
+    }
+  } catch (error) {
+    console.error("[trip] Error notifying compatible deliveries:", error)
+  }
+}
+
+const COMPATIBLE_ORIGIN_MAX_KM = Number(process.env.COMPATIBLE_ORIGIN_MAX_KM || 30)
+const COMPATIBLE_DESTINATION_MAX_KM = Number(process.env.COMPATIBLE_DESTINATION_MAX_KM || 30)
+
+const getCompatibilityLabel = (score) => {
+  if (score >= 80) return "Parfait"
+  if (score >= 60) return "Bon"
+  if (score >= 40) return "Acceptable"
+  return "Hors zone"
+}
+
+export const listCompatibleTripsForDelivery = async (req, res, next) => {
+  try {
+    const { deliveryId } = req.params
+
+    const deliveryRows = await exec(
+      null,
+      `SELECT d.requester_id, d.status
+       FROM Deliveries d
+       WHERE d.id = ? LIMIT 1`,
+      [deliveryId],
+    )
+
+    if (!deliveryRows[0]) {
+      return next(createError(404, "Delivery not found"))
+    }
+
+    if (deliveryRows[0].requester_id !== req.user.id) {
+      return next(createError(403, "Only the delivery owner can view compatible trips"))
+    }
+
+    const locRows = await exec(
+      null,
+      `SELECT type, latitude, longitude FROM DeliveryLocations WHERE delivery_id = ?`,
+      [deliveryId],
+    )
+    let pickupLat = null, pickupLng = null, dropoffLat = null, dropoffLng = null
+    for (const r of locRows) {
+      if (r.type === "PICKUP" && r.latitude != null) { pickupLat = Number(r.latitude); pickupLng = Number(r.longitude) }
+      if (r.type === "DROPOFF" && r.latitude != null) { dropoffLat = Number(r.latitude); dropoffLng = Number(r.longitude) }
+    }
+
+    if (!pickupLat || !dropoffLat) {
+      return next(createError(400, "Delivery location coordinates are incomplete"))
+    }
+
+    const allTrips = await listAvailableTripRecords(null, {})
+    const enriched = []
+
+    for (const trip of allTrips) {
+      const originCoords = trip.origin?.location?.coordinates
+      const destCoords = trip.destination?.location?.coordinates
+      if (!originCoords || !destCoords) continue
+
+      const originDistance = haversineDistance(
+        { lat: pickupLat, lng: pickupLng },
+        { lat: originCoords[1], lng: originCoords[0] },
+      )
+      const destinationDistance = haversineDistance(
+        { lat: dropoffLat, lng: dropoffLng },
+        { lat: destCoords[1], lng: destCoords[0] },
+      )
+
+      const originKm = originDistance != null ? Math.round((originDistance / 1000) * 100) / 100 : null
+      const destinationKm = destinationDistance != null ? Math.round((destinationDistance / 1000) * 100) / 100 : null
+
+      const score = originKm != null && destinationKm != null
+        ? Math.max(0, Math.min(100, Math.round(100 - (originKm + destinationKm))))
+        : 0
+      const isCompatible = originKm != null && destinationKm != null
+        && originKm < COMPATIBLE_ORIGIN_MAX_KM && destinationKm < COMPATIBLE_DESTINATION_MAX_KM
+
+      enriched.push({
+        ...trip,
+        acceptsDeliveries: ["planned", "active"].includes(trip.status) && Number(trip.availableCapacity || 0) > 0,
+        compatibility: {
+          originDistance: originKm,
+          destinationDistance: destinationKm,
+          score,
+          isCompatible,
+          label: getCompatibilityLabel(score),
+        },
+      })
+    }
+
+    enriched.sort((a, b) => b.compatibility.score - a.compatibility.score)
+
+    return sendSuccess(res, 200, "Compatible trips fetched successfully", { trips: enriched })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export const createTrip = async (req, res, next) => {
+  try {
+    const driver = await findDriverByUserId(null, req.user.id)
+    if (!driver) {
+      return next(createError(404, "Driver profile not found"))
+    }
+
+    if (!driver.isDocumentsVerified) {
+      return next(createError(403, "Driver account is not verified for trips"))
+    }
+
+    const tripId = crypto.randomUUID()
+    const routeData = req.body.route || null
+    const routeGeometry = routeData?.points || null
+    const routeDistanceMeters = routeData?.distanceMeters ?? null
+    const routeDurationSeconds = routeData?.durationSeconds ?? null
+
+    const trip = await withTransaction(async (connection) => {
+      return createTripRecord(connection, {
+        id: tripId,
+        driverId: req.user.id,
+        title: req.body.title,
+        origin: req.body.origin,
+        destination: req.body.destination,
+        departureTime: req.body.departureTime,
+        expectedArrivalTime: req.body.expectedArrivalTime || null,
+        maxDeliveries: req.body.maxDeliveries || 3,
+        availableCapacity: req.body.maxDeliveries || 3,
+        vehicleType: req.body.vehicleType || null,
+        acceptedPackageSize: req.body.acceptedPackageSize || "any",
+        status: "planned",
+        notes: req.body.notes,
+        routeGeometry,
+        routeDistanceMeters,
+        routeDurationSeconds,
+      })
+    })
+
+    const pdfUrl = buildTripPdfUrl(req, trip.id)
+    notifyCompatibleDeliverySenders(trip)
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[DRIVER ROUTE SELECTED] Trip ${trip.id} distance=${routeDistanceMeters}m duration=${routeDurationSeconds}s`)
+    }
+    return sendSuccess(res, 201, "Trip created successfully", { trip, pdfUrl })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export const getTripPdf = async (req, res, next) => {
+  try {
+    const context = await loadTripPrintContext(req.params.tripId)
+    if (!context) {
+      return next(createError(404, "Trip not found"))
+    }
+
+    const isAdminLike = req.user.role === "admin" || req.user.role === "authority"
+    const isDriverOwner = context.trip.driverId === req.user.id
+
+    if (!isAdminLike && !isDriverOwner) {
+      return next(createError(403, "You are not authorized to access this trip PDF"))
+    }
+
+    const buffer = await generateTripPdfBuffer(context.payload)
+    return sendPdfInline(res, {
+      fileName: `trip-${req.params.tripId}.pdf`,
+      buffer,
+    })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export const listDriverTrips = async (req, res, next) => {
+  try {
+    const driver = await findDriverByUserId(null, req.user.id)
+    if (!driver) {
+      return next(createError(404, "Driver profile not found"))
+    }
+
+    const trips = await listDriverTripRecords(null, req.user.id, {
+      status: req.query.status || null,
+    })
+
+    return sendSuccess(res, 200, "Trips fetched successfully", { trips })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export const listAvailableTrips = async (req, res, next) => {
+  try {
+    const page = toBoundedPositiveInteger(req.query.page, {
+      fallback: DEFAULT_AVAILABLE_TRIPS_PAGE,
+      min: 1,
+    })
+    const limit = toBoundedPositiveInteger(req.query.limit, {
+      fallback: DEFAULT_AVAILABLE_TRIPS_LIMIT,
+      min: 1,
+      max: MAX_AVAILABLE_TRIPS_LIMIT,
+    })
+    const offset = (page - 1) * limit
+
+    const filters = {
+      originText: req.query.originText ? String(req.query.originText).trim() : null,
+      destinationText: req.query.destinationText ? String(req.query.destinationText).trim() : null,
+      departureFrom: toOptionalDate(req.query.departureFrom),
+      departureTo: toOptionalDate(req.query.departureTo),
+      minCapacity: req.query.minCapacity ? Number(req.query.minCapacity) : null,
+    }
+
+    const trips = await listAvailableTripRecords(null, {
+      ...filters,
+      limit,
+      offset,
+    })
+    const total = await countAvailableTrips(null, filters)
+
+    return sendSuccess(res, 200, "Available trips fetched successfully", {
+      trips: trips.map(withTripMeta),
+      pagination: {
+        total,
+        page,
+        pages: Math.ceil(total / limit),
+        limit,
+      },
+    })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export const getTripById = async (req, res, next) => {
+  try {
+    const { tripId } = req.params
+    const trip = await findTripById(null, tripId, { includeDriver: true })
+
+    if (!trip) {
+      return next(createError(404, "Trip not found"))
+    }
+
+    const includeDeliveries = String(req.query.includeDeliveries || "").trim().toLowerCase() === "true"
+    if (!includeDeliveries) {
+      return sendSuccess(res, 200, "Trip fetched successfully", {
+        trip: withTripMeta(trip),
+        acceptsDeliveries: withTripMeta(trip).acceptsDeliveries,
+      })
+    }
+
+    const page = toBoundedPositiveInteger(req.query.deliveriesPage, {
+      fallback: DEFAULT_DELIVERIES_PAGE,
+      min: 1,
+    })
+    const limit = toBoundedPositiveInteger(req.query.deliveriesLimit, {
+      fallback: DEFAULT_DELIVERIES_LIMIT,
+      min: 1,
+      max: MAX_DELIVERIES_LIMIT,
+    })
+    const offset = (page - 1) * limit
+
+    const deliveryRows = await exec(
+      null,
+      `SELECT d.id, d.status, d.recipient_name, d.created_at,
+              pl.address AS pickup_address,
+              dl.address AS dropoff_address
+       FROM Deliveries d
+       LEFT JOIN DeliveryLocations pl ON pl.delivery_id = d.id AND pl.type = 'PICKUP'
+       LEFT JOIN DeliveryLocations dl ON dl.delivery_id = d.id AND dl.type = 'DROPOFF'
+       WHERE d.trip_id = ?
+       ORDER BY d.created_at DESC
+       LIMIT ${limit} OFFSET ${offset}`,
+      [tripId],
+    )
+
+    const totalRows = await exec(
+      null,
+      `SELECT COUNT(*) AS total FROM Deliveries WHERE trip_id = ?`,
+      [tripId],
+    )
+
+    const linkedDeliveries = deliveryRows.map((row) => ({
+      id: row.id,
+      status: row.status,
+      pickupAddress: row.pickup_address || "",
+      dropoffAddress: row.dropoff_address || "",
+      recipientName: row.recipient_name || "",
+      createdAt: row.created_at,
+    }))
+
+    const total = Number(totalRows[0]?.total || 0)
+
+    return sendSuccess(res, 200, "Trip fetched successfully", {
+      trip: withTripMeta(trip),
+      linkedDeliveries,
+      linkedDeliveriesPagination: {
+        total,
+        page,
+        pages: Math.ceil(total / limit),
+        limit,
+      },
+      acceptsDeliveries: withTripMeta(trip).acceptsDeliveries,
+    })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export const updateTripStatus = async (req, res, next) => {
+  try {
+    const { tripId } = req.params
+    const { status } = req.body
+
+    const isAdminLike = req.user.role === "admin" || req.user.role === "authority"
+
+    const trip = await findTripById(null, tripId)
+    if (!trip) {
+      return next(createError(404, "Trip not found"))
+    }
+
+    if (!isAdminLike && trip.driverId !== req.user.id) {
+      return next(createError(403, "You are not authorized to update this trip"))
+    }
+
+    const updated = await updateTripStatusRecord(null, tripId, status)
+    return sendSuccess(res, 200, "Trip status updated successfully", { trip: updated })
+  } catch (error) {
+    next(error)
+  }
+}
