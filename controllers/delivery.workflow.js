@@ -611,7 +611,7 @@ export const getDeliveryById = async (req, res, next) => {
     })
 
     if (!delivery) {
-      return next(createError(403, "You are not authorized to access this delivery"))
+      return next(createError(404, "Delivery not found"))
     }
 
     assertCanAccessDelivery({ delivery, user: req.user })

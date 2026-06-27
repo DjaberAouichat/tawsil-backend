@@ -144,17 +144,35 @@ export const getRouteDirections = async (origin, destination, waypoints = [], op
 export const geocodeAddress = async (address) => {
   try {
     const url = `${GEOAPIFY_BASE_URL}/geocode/search`
-    const response = await axios.get(url, {
-      params: { text: address, apiKey: GEOAPIFY_API_KEY, format: "geojson" },
-    })
-    if (response?.data?.error) {
-      throw createError(502, `Geoapify geocoding error: ${response.data.error}`, {
-        code: "GEOCODING_PROVIDER_ERROR", providerMessage: response.data.message || response.data.error,
+
+    const tryGeocode = async (query) => {
+      const res = await axios.get(url, {
+        params: { text: query, apiKey: GEOAPIFY_API_KEY, format: "geojson", lang: "ar", filter: "countrycode:dz" },
       })
+      if (res?.data?.error) {
+        throw createError(502, `Geoapify geocoding error: ${res.data.error}`, {
+          code: "GEOCODING_PROVIDER_ERROR", providerMessage: res.data.message || res.data.error,
+        })
+      }
+      return res?.data?.features?.[0] || null
     }
-    const feature = response?.data?.features?.[0]
+
+    let feature = await tryGeocode(address)
+
     if (!feature) {
-      console.error(`Geoapify geocode zero results. URL: ${url}?text=${encodeURIComponent(address)}&apiKey=***&format=geojson. Response keys: ${Object.keys(response?.data || {}).join(",")}`)
+      const amended = `${address}, Algeria`
+      console.warn(`Geoapify geocode zero results for "${address}", retrying with "${amended}"`)
+      feature = await tryGeocode(amended)
+    }
+
+    if (!feature && /[\u0600-\u06FF]/.test(address)) {
+      const amended = `${address}, الجزائر`
+      console.warn(`Geoapify geocode zero results for "${address}", retrying with "${amended}"`)
+      feature = await tryGeocode(amended)
+    }
+
+    if (!feature) {
+      console.error(`Geoapify geocode zero results for address: "${address}"`)
       throw createError(404, "Address not found", { code: "ADDRESS_NOT_FOUND" })
     }
     return {
