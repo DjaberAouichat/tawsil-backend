@@ -1,5 +1,5 @@
 import { exec } from "../lib/db.js"
-import { findDriverByUserId, getDriverLocation } from "../models/driver.model.js"
+import { findDriverByUserId, getDriverLocation, markApprovalWelcomeShown } from "../models/driver.model.js"
 import { distanceMeters } from "../utils/maps.js"
 import { reverseGeocode } from "../utils/maps.js"
 import { sendSuccess, createError } from "../utils/response.js"
@@ -443,6 +443,29 @@ export const saveFilterPreferences = async (req, res, next) => {
     )
 
     return sendSuccess(res, 200, "Filter preferences saved successfully", { preferences })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export const markApprovalWelcomeShownHandler = async (req, res, next) => {
+  try {
+    const driver = await findDriverByUserId(null, req.user.id)
+    if (!driver) {
+      return next(createError(404, "Driver profile not found"))
+    }
+
+    if (driver.reviewStatus !== "approved") {
+      return next(createError(400, "Driver account is not approved"))
+    }
+
+    await markApprovalWelcomeShown(null, req.user.id)
+
+    console.log(`[DRIVER] User ${req.user.id} approval_welcome_shown set to TRUE`)
+
+    return sendSuccess(res, 200, "Approval welcome marked as shown", {
+      approvalWelcomeShown: true,
+    })
   } catch (error) {
     next(error)
   }

@@ -374,6 +374,23 @@ export const login = async (req, res, next) => {
       tokenVersion: lookupUser.tokenVersion,
     })
 
+    const accountActive = !lookupUser.isBlocked && !lookupUser.isSuspended
+
+    if (role === "driver") {
+      console.log(`[Login] Driver login userId=${lookupUser.id}`)
+      console.log(`  verificationStatus= ${driverInfo?.reviewStatus}`)
+      console.log(`  approvalWelcomeShown= ${!!driverInfo?.approvalWelcomeShown}`)
+      console.log(`  isDocumentsVerified= ${!!driverInfo?.isDocumentsVerified}`)
+      console.log(`  accountActive= ${accountActive}`)
+      console.log(`  Decision: ${
+        driverInfo?.reviewStatus === "approved" && !!driverInfo?.isDocumentsVerified && accountActive
+          ? !!driverInfo?.approvalWelcomeShown ? "Go Dashboard" : "Show Welcome"
+          : driverInfo?.reviewStatus === "rejected" ? "Go Rejected Screen"
+          : driverInfo?.reviewStatus === "blocked" ? "Go Blocked Screen"
+          : "Go Pending Screen"
+      }`)
+    }
+
     return sendSuccess(res, 200, "Login successful", {
       token,
       user: {
@@ -386,6 +403,9 @@ export const login = async (req, res, next) => {
               driverApprovedBy: driverInfo?.reviewedBy || null,
               driverApprovedAt: driverInfo?.reviewedAt || null,
               driverIsVerified: driverStatus === "approved" && !!driverInfo?.isDocumentsVerified,
+              approvalWelcomeShown: !!driverInfo?.approvalWelcomeShown,
+              isDocumentsVerified: !!driverInfo?.isDocumentsVerified,
+              accountActive,
             }
           : {}),
       },
@@ -622,6 +642,18 @@ export const getCurrentUser = async (req, res, next) => {
       }
     }
 
+    const accountActive = role === "driver"
+      ? !req.user?.isBlocked && !req.user?.isSuspended
+      : true
+
+    if (role === "driver") {
+      console.log(`[GetCurrentUser] Driver userId=${userId}`)
+      console.log(`  verificationStatus= ${driverInfo?.reviewStatus}`)
+      console.log(`  approvalWelcomeShown= ${!!driverInfo?.approvalWelcomeShown}`)
+      console.log(`  isDocumentsVerified= ${!!driverInfo?.isDocumentsVerified}`)
+      console.log(`  accountActive= ${accountActive}`)
+    }
+
     return sendSuccess(res, 200, "Current user fetched successfully", {
       user: {
         ...req.user,
@@ -629,8 +661,11 @@ export const getCurrentUser = async (req, res, next) => {
         driverStatus,
         driverReviewReason: role === "driver" ? driverInfo?.reviewReason || null : null,
         driverIsVerified: role === "driver" ? driverStatus === "approved" : null,
-          driverApprovedBy: role === "driver" ? driverInfo?.reviewedBy || null : null,
-          driverApprovedAt: role === "driver" ? driverInfo?.reviewedAt || null : null,
+        driverApprovedBy: role === "driver" ? driverInfo?.reviewedBy || null : null,
+        driverApprovedAt: role === "driver" ? driverInfo?.reviewedAt || null : null,
+        approvalWelcomeShown: role === "driver" ? !!driverInfo?.approvalWelcomeShown : null,
+        isDocumentsVerified: role === "driver" ? !!driverInfo?.isDocumentsVerified : null,
+        accountActive,
         verification,
       },
     })

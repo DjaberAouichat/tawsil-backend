@@ -83,7 +83,8 @@ export const findDriverByUserId = async (connection, userId) => {
             rating,
             vehicle_info AS vehicleInfo,
             filter_preferences AS filterPreferences,
-            notification_preferences AS notificationPreferences
+            notification_preferences AS notificationPreferences,
+            approval_welcome_shown AS approvalWelcomeShown
      FROM Drivers
      WHERE participant_id = ?
      LIMIT 1`,
@@ -149,7 +150,7 @@ export const updateDriverAvailability = async (connection, driverId, { isAvailab
 export const updateDriverReviewStatus = async (
   connection,
   driverId,
-  { reviewStatus, verificationStatus, reviewReason, reviewedBy, reviewedAt, approvedAt, isDocumentsVerified, isAvailable, availability },
+  { reviewStatus, verificationStatus, reviewReason, reviewedBy, reviewedAt, approvedAt, isDocumentsVerified, isAvailable, availability, approvalWelcomeShown },
 ) => {
   const updates = []
   const params = []
@@ -194,6 +195,11 @@ export const updateDriverReviewStatus = async (
     params.push(isDocumentsVerified ? 1 : 0)
   }
 
+  if (approvalWelcomeShown !== undefined) {
+    updates.push("approval_welcome_shown = ?")
+    params.push(approvalWelcomeShown ? 1 : 0)
+  }
+
   if (reviewReason !== undefined) {
     updates.push("review_reason = ?")
     params.push(reviewReason || null)
@@ -215,6 +221,14 @@ export const updateDriverReviewStatus = async (
 
   params.push(driverId)
   await exec(connection, `UPDATE Drivers SET ${updates.join(", ")} WHERE participant_id = ?`, params)
+}
+
+export const markApprovalWelcomeShown = async (connection, driverId) => {
+  await exec(
+    connection,
+    `UPDATE Drivers SET approval_welcome_shown = 1 WHERE participant_id = ?`,
+    [driverId],
+  )
 }
 
 // --- Vehicle ---
@@ -416,6 +430,47 @@ export const addDriverVerificationTimelineEvent = async (
     [id],
   )
   return rows[0] ? mapTimelineRow(rows[0]) : null
+}
+
+export const insertDriverStatusHistory = async (connection, { driverId, oldStatus, newStatus, changedBy, comment }) => {
+  const id = crypto.randomUUID()
+  await exec(
+    connection,
+    `INSERT INTO DriverStatusHistory (id, driver_id, old_status, new_status, changed_by, comment)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [id, driverId, oldStatus || null, newStatus, changedBy || null, comment || null],
+  )
+  return id
+}
+
+export const listDriverStatusHistory = async (connection, driverId, { limit = 100, offset = 0 } = {}) => {
+  const parsedLimit = Number.parseInt(String(limit), 10)
+  const parsedOffset = Number.parseInt(String(offset), 10)
+  const safeLimit = Number.isFinite(parsedLimit) ? Math.max(0, parsedLimit) : 100
+  const safeOffset = Number.isFinite(parsedOffset) ? Math.max(0, parsedOffset) : 0
+  const rows = await exec(
+    connection,
+    `SELECT h.id, h.driver_id, h.old_status, h.new_status, h.changed_by, h.comment, h.changed_at,
+            u.first_name AS changed_by_first_name, u.last_name AS changed_by_last_name
+     FROM DriverStatusHistory h
+     LEFT JOIN Users u ON u.id = h.changed_by
+     WHERE h.driver_id = ?
+     ORDER BY h.changed_at DESC
+     LIMIT ${safeLimit} OFFSET ${safeOffset}`,
+    [driverId],
+  )
+  return rows.map((r) => ({
+    id: r.id,
+    driverId: r.driver_id,
+    oldStatus: r.old_status,
+    newStatus: r.new_status,
+    changedBy: r.changed_by,
+    changedByName: r.changed_by_first_name && r.changed_by_last_name
+      ? `${r.changed_by_first_name} ${r.changed_by_last_name}`.trim()
+      : null,
+    comment: r.comment,
+    changedAt: r.changed_at,
+  }))
 }
 
 export const listDriverVerificationTimeline = async (connection, driverId, { limit = 100, offset = 0 } = {}) => {

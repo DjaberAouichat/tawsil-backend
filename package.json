@@ -7,23 +7,23 @@
   },
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js",
+    "dev": "nodemon server.js",
     "seed": "node scripts/seed.js",
     "smoke:test": "node scripts/api-smoke-test.js",
     "verify": "npm run seed && npm run smoke:test"
   },
   "dependencies": {
-    "@faker-js/faker": "^10.4.0",
     "axios": "^1.10.0",
     "bcryptjs": "^3.0.3",
+    "compression": "^1.8.1",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
     "express-rate-limit": "^7.4.1",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
     "multer": "^1.4.5-lts.1",
-    "node-cron": "^3.0.3",
     "mysql2": "^3.22.5",
+    "node-cron": "^3.0.3",
     "nodemailer": "^8.0.7",
     "pdfkit": "^0.18.0",
     "socket.io": "^4.8.3",
@@ -31,6 +31,8 @@
     "zod": "^3.25.67"
   },
   "devDependencies": {
+    "@faker-js/faker": "^10.4.0",
+    "nodemon": "^3.1.0",
     "socket.io-client": "^4.8.3"
   }
 }

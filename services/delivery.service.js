@@ -14,7 +14,7 @@ import { listDriverTrips as listDriverTripsModel } from "../models/trip.model.js
 // ── Constants ──────────────────────────────────────────────────────────
 
 const DELIVERY_ESTIMATE_TTL_MINUTES = Number.parseInt(String(process.env.DELIVERY_ESTIMATE_TTL_MINUTES || "30"), 10) || 30
-const DELIVERY_OTP_TTL_MINUTES_DEFAULT = 1440
+const DELIVERY_OTP_TTL_MINUTES_DEFAULT = 15
 const CENTRAL_REGION_SEARCH_RADIUS_METERS = Number.parseInt(String(process.env.CENTRAL_REGION_SEARCH_RADIUS_METERS || "50000"), 10) || 50000
 const CENTRAL_REGION_MIN_DRIVERS = Number.parseInt(String(process.env.CENTRAL_REGION_MIN_DRIVERS || "3"), 10) || 3
 const CENTRAL_REGION_MAX_DRIVERS = Number.parseInt(String(process.env.CENTRAL_REGION_MAX_DRIVERS || "10"), 10) || 10
@@ -432,6 +432,23 @@ export const findCompatibleDriversForDelivery = async (connection, { pickupCoord
       " OR (t.accepted_package_size = 'up_to_medium' AND " + sizeLevel + " <= 2)" +
       " OR (t.accepted_package_size = 'up_to_large' AND " + sizeLevel + " <= 3))"
 
+  const pickupLat = Number(pickupCoordinates[1])
+  const pickupLng = Number(pickupCoordinates[0])
+  const dropoffLat = Number(dropoffCoordinates[1])
+  const dropoffLng = Number(dropoffCoordinates[0])
+
+  const radiusMeters = CENTRAL_REGION_SEARCH_RADIUS_METERS
+  const radiusDeg = radiusMeters / 111000.0
+
+  const pickupLatMin = pickupLat - radiusDeg
+  const pickupLatMax = pickupLat + radiusDeg
+  const pickupLngMin = pickupLng - radiusDeg
+  const pickupLngMax = pickupLng + radiusDeg
+  const dropoffLatMin = dropoffLat - radiusDeg
+  const dropoffLatMax = dropoffLat + radiusDeg
+  const dropoffLngMin = dropoffLng - radiusDeg
+  const dropoffLngMax = dropoffLng + radiusDeg
+
   const sql =
     "SELECT" +
     " d.participant_id AS driver_id," +
@@ -457,9 +474,22 @@ export const findCompatibleDriversForDelivery = async (connection, { pickupCoord
     " AND d.availability = 'available'" +
     " AND d.review_status = 'approved'" +
     " AND " + sizeFilter +
+    " AND (" +
+    "   (origin_loc.latitude BETWEEN ? AND ? AND origin_loc.longitude BETWEEN ? AND ?)" +
+    "   OR" +
+    "   (dest_loc.latitude BETWEEN ? AND ? AND dest_loc.longitude BETWEEN ? AND ?)" +
+    " )" +
+    " AND (" +
+    "   dl.latitude IS NULL" +
+    "   OR (dl.latitude BETWEEN ? AND ? AND dl.longitude BETWEEN ? AND ?)" +
+    " )" +
     " ORDER BY dl.timestamp DESC"
 
-  const rows = await exec(pool, sql)
+  const rows = await exec(pool, sql, [
+    pickupLatMin, pickupLatMax, pickupLngMin, pickupLngMax,
+    dropoffLatMin, dropoffLatMax, dropoffLngMin, dropoffLngMax,
+    pickupLatMin, pickupLatMax, pickupLngMin, pickupLngMax,
+  ])
 
   const candidates = []
   const visited = new Set()
@@ -487,6 +517,16 @@ export const findCompatibleDriversForDelivery = async (connection, { pickupCoord
 
     const pickupDistance = driverLocation ? distanceMeters(driverLocation, pickupCoordinates) : null
     const isNear = Number.isFinite(pickupDistance) && pickupDistance <= DRIVER_MATCH_MAX_PICKUP_DISTANCE_METERS
+
+    const haversinePickupToOrigin = distanceMeters(pickupCoordinates, originCoords)
+    const haversineDropoffToDest = distanceMeters(dropoffCoordinates, destCoords)
+    const haversineDistanceMeters = Math.min(
+      Number.isFinite(haversinePickupToOrigin) ? haversinePickupToOrigin : Infinity,
+      Number.isFinite(haversineDropoffToDest) ? haversineDropoffToDest : Infinity,
+      Number.isFinite(pickupDistance) ? pickupDistance : Infinity,
+    )
+    if (!Number.isFinite(haversineDistanceMeters) || haversineDistanceMeters > radiusMeters) continue
+
     const pickupToRouteScore = pickupToRoute / DRIVER_MATCH_MAX_ROUTE_CORRIDOR_METERS
     const dropoffToRouteScore = dropoffToRoute / DRIVER_MATCH_MAX_ROUTE_CORRIDOR_METERS
     const detourScore = detour / DRIVER_MATCH_MAX_TRIP_DETOUR_METERS
@@ -506,11 +546,12 @@ export const findCompatibleDriversForDelivery = async (connection, { pickupCoord
       detourMeters: Math.round(detour),
       isNearDriver: isNear,
       isOnRoute: pickupToRoute <= DRIVER_MATCH_MAX_ROUTE_CORRIDOR_METERS,
+      haversineDistanceMeters: Math.round(haversineDistanceMeters),
       driverLocation: driverLocation ? { coordinates: driverLocation, heading: row.heading === null ? null : Number(row.heading), speed: row.speed === null ? null : Number(row.speed), timestamp: row.locationTimestamp } : null,
     })
   }
 
-  results.sort((a, b) => a.score - b.score)
+  results.sort((a, b) => a.haversineDistanceMeters - b.haversineDistanceMeters || a.score - b.score)
   return results
 }
 

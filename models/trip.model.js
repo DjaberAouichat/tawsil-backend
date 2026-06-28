@@ -115,6 +115,22 @@ const buildAvailableTripsQuery = (
   }
 }
 
+export const findOverlappingTrips = async (connection, driverId, departureTime, expectedArrivalTime) => {
+  const rows = await exec(
+    connection,
+    `SELECT id, driver_id, departure_time, expected_arrival_time, status
+     FROM Trips
+     WHERE driver_id = ?
+       AND status IN ('planned', 'active')
+       AND departure_time < ?
+       AND COALESCE(expected_arrival_time, '9999-12-31 23:59:59') > ?
+     ORDER BY departure_time ASC
+     LIMIT 1`,
+    [driverId, expectedArrivalTime || departureTime, departureTime],
+  )
+  return rows[0] || null
+}
+
 export const createTrip = async (
   connection,
   {
@@ -388,4 +404,79 @@ export const countAvailableTrips = async (
 export const updateTripStatus = async (connection, tripId, status) => {
   await exec(connection, `UPDATE Trips SET status = ? WHERE id = ?`, [status, tripId])
   return findTripById(connection, tripId, { includeDriver: false })
+}
+
+export const updateTripDetails = async (connection, tripId, updates) => {
+  const fields = []
+  const params = []
+
+  for (const [key, value] of Object.entries(updates)) {
+    if (value !== undefined) {
+      fields.push(`${key} = ?`)
+      params.push(value)
+    }
+  }
+
+  if (fields.length === 0) return findTripById(connection, tripId)
+
+  params.push(tripId)
+  await exec(connection, `UPDATE Trips SET ${fields.join(", ")} WHERE id = ?`, params)
+  return findTripById(connection, tripId, { includeDriver: false })
+}
+
+export const deleteTrip = async (connection, tripId) => {
+  await exec(connection, `DELETE FROM Trips WHERE id = ?`, [tripId])
+}
+
+export const countActiveDeliveriesForTrip = async (connection, tripId) => {
+  const rows = await exec(
+    connection,
+    `SELECT COUNT(*) AS total
+     FROM Deliveries
+     WHERE trip_id = ?
+       AND status NOT IN ('Delivered', 'CancelledByUser', 'CancelledByDriver', 'Rejected', 'FailedDelivery', 'Refunded')`,
+    [tripId],
+  )
+  return Number(rows[0]?.total || 0)
+}
+
+export const autoCompleteExpiredTrips = async (connection) => {
+  const rows = await exec(
+    connection,
+    `SELECT id FROM Trips
+     WHERE status IN ('planned', 'active')
+       AND expected_arrival_time IS NOT NULL
+       AND expected_arrival_time <= NOW()`,
+  )
+
+  let completed = 0
+  for (const row of rows) {
+    const activeDeliveries = await countActiveDeliveriesForTrip(connection, row.id)
+    if (activeDeliveries === 0) {
+      await exec(connection, `UPDATE Trips SET status = 'completed' WHERE id = ?`, [row.id])
+      completed++
+    }
+  }
+  return completed
+}
+
+export const checkAndCompleteTrip = async (connection, tripId) => {
+  const trip = await exec(
+    connection,
+    `SELECT id, status, expected_arrival_time FROM Trips WHERE id = ? LIMIT 1`,
+    [tripId],
+  )
+  if (!trip[0]) return false
+  if (trip[0].status !== 'planned' && trip[0].status !== 'active') return false
+  if (!trip[0].expected_arrival_time) return false
+
+  const now = new Date()
+  if (new Date(trip[0].expected_arrival_time) > now) return false
+
+  const activeDeliveries = await countActiveDeliveriesForTrip(connection, tripId)
+  if (activeDeliveries === 0) {
+    await exec(connection, `UPDATE Trips SET status = 'completed' WHERE id = ?`, [tripId])
+    return true
+  }
+  return false
 }

@@ -3,6 +3,7 @@ import http from 'http';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import compression from 'compression';
 
 const currentFilePath = fileURLToPath(import.meta.url);
 const currentDir = path.dirname(currentFilePath);
@@ -55,6 +56,7 @@ const { default: vehicleRoutes } = await import('./routes/vehicle.routes.js');
 const { default: documentRoutes } = await import('./routes/document.routes.js');
 const { default: uploadRoutes } = await import('./routes/upload.routes.js');
 const { default: promotionRoutes } = await import('./routes/promotion.routes.js');
+const { default: ratingRoutes } = await import('./routes/rating.routes.js');
 const { initSocket } = await import('./socket/index.js');
 const { startExpiringDeliveryCron } = await import('./services/expiring-deliveries.cron.js');
 const { securityHeaders } = await import('./middleware/auth.js');
@@ -88,7 +90,15 @@ if (!process.env.JWT_EXPIRES_IN) {
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
+app.use(compression());
 app.use(securityHeaders);
+
+if (process.env.NODE_ENV !== 'production') {
+  app.use((req, _res, next) => {
+    console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
+    next();
+  });
+}
 
 const DB_RETRY_DELAY_MS = Number(process.env.DB_RETRY_DELAY_MS) || 15000;
 let isDatabaseConnected = false;
@@ -171,7 +181,7 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = Number(process.env.WEBSITES_PORT || process.env.PORT || 3000);
 
 const canServeWithoutDatabase = (requestPath) => {
   return (
@@ -208,6 +218,7 @@ app.use('/api/rates', rateRoutes);
 app.use('/api/vehicles', vehicleRoutes);
 app.use('/api/documents', documentRoutes);
 app.use('/api/promotions', promotionRoutes);
+app.use('/api/ratings', ratingRoutes);
 app.use('/api', uploadRoutes);
 
 app.use((req, res) => {
@@ -220,14 +231,14 @@ app.use((req, res) => {
 
 app.use((err, req, res, next) => {
   const statusCode = err.statusCode || 500;
-  console.error('[ADMIN CRASH] Error caught by Express error handler:');
-  console.error('[ADMIN CRASH]   URL:', req?.method, req?.originalUrl || req?.url);
-  console.error('[ADMIN CRASH]   Status:', statusCode);
-  console.error('[ADMIN CRASH]   Message:', err?.message);
+  console.error('[SERVER ERROR] Error caught by Express error handler:');
+  console.error('[SERVER ERROR]   URL:', req?.method, req?.originalUrl || req?.url);
+  console.error('[SERVER ERROR]   Status:', statusCode);
+  console.error('[SERVER ERROR]   Message:', err?.message);
   if (process.env.NODE_ENV !== 'production') {
-    console.error('[ADMIN CRASH]   Stack:', err?.stack);
-    if (err?.sql) console.error('[ADMIN CRASH]   SQL:', err.sql);
-    if (err?.sqlMessage) console.error('[ADMIN CRASH]   SQL Message:', err.sqlMessage);
+    console.error('[SERVER ERROR]   Stack:', err?.stack);
+    if (err?.sql) console.error('[SERVER ERROR]   SQL:', err.sql);
+    if (err?.sqlMessage) console.error('[SERVER ERROR]   SQL Message:', err.sqlMessage);
   }
 
   res.status(statusCode).json({
@@ -238,9 +249,13 @@ app.use((err, req, res, next) => {
 });
 
 const ADMIN_EMAIL = 'admin@tawsil.dz';
-const ADMIN_PASSWORD_PLAIN = 'adminadmin';
+const ADMIN_PASSWORD_PLAIN = process.env.DEFAULT_ADMIN_PASSWORD || (process.env.NODE_ENV !== 'production' ? 'adminadmin' : null);
 
 const ensureAdminAccount = async () => {
+  if (!ADMIN_PASSWORD_PLAIN) {
+    console.warn('[WARN] DEFAULT_ADMIN_PASSWORD not set. Skipping admin account bootstrap in production.');
+    return;
+  }
   try {
     const pool = getPool();
     const [existing] = await pool.execute(
@@ -281,9 +296,13 @@ const AUTHORITY_ACCOUNTS = [
   { email: 'Gendarmerie@tawsil.dz', firstName: 'Gendarmerie', lastName: 'Tawsil', phone: '+213770000002' },
   { email: 'DirectorateOfTransportation@tawsil.dz', firstName: 'Direction', lastName: 'Transport', phone: '+213770000003' },
 ];
-const AUTHORITY_PASSWORD_PLAIN = 'tawsilgo';
+const AUTHORITY_PASSWORD_PLAIN = process.env.DEFAULT_AUTHORITY_PASSWORD || (process.env.NODE_ENV !== 'production' ? 'tawsilgo' : null);
 
 const ensureAuthorityAccounts = async () => {
+  if (!AUTHORITY_PASSWORD_PLAIN) {
+    console.warn('[WARN] DEFAULT_AUTHORITY_PASSWORD not set. Skipping authority accounts bootstrap in production.');
+    return;
+  }
   try {
     const pool = getPool();
     const { randomUUID } = await import('crypto');

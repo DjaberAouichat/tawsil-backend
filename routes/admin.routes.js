@@ -13,6 +13,7 @@ import {
   listAdminDriverReviews,
   updateDriverReviewStatusHandler,
   getDriverVerificationTimelineHandler,
+  getDriverStatusHistoryHandler,
   getAdminDashboardSummary,
   getAdminDashboardStats,
   getAuthorityDashboardSummary,
@@ -98,6 +99,11 @@ router.get(
   "/drivers/:driverId/verification-timeline",
   authorize("admin", "authority"),
   asyncHandler(getDriverVerificationTimelineHandler),
+)
+router.get(
+  "/drivers/:driverId/status-history",
+  authorize("admin", "authority"),
+  asyncHandler(getDriverStatusHistoryHandler),
 )
 router.get("/verifications", authorize("admin", "authority"), asyncHandler(listDriversWithSubmittedDocuments))
 router.get("/deliveries", authorize("authority", "admin"), asyncHandler(listAuthorityDeliveries))

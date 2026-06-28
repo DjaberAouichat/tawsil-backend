@@ -6,6 +6,7 @@ import {
   getCurrentLocation,
   getCoverageZones,
   getDriverStats,
+  markApprovalWelcomeShownHandler,
   saveFilterPreferences,
   saveNotificationPreferences,
 } from "../controllers/driver.controller.js"
@@ -15,6 +16,7 @@ const router = express.Router()
 router.use(asyncHandler(authenticate))
 
 router.get("/stats", authorize("driver"), asyncHandler(getDriverStats))
+router.post("/approval-welcome-shown", authorize("driver"), asyncHandler(markApprovalWelcomeShownHandler))
 router.get("/location/current", authorize("driver"), asyncHandler(getCurrentLocation))
 router.get("/coverage-zones", authorize("driver"), asyncHandler(getCoverageZones))
 router.put("/filter-preferences", authorize("driver"), validateRequest(saveFilterPreferencesSchema), asyncHandler(saveFilterPreferences))

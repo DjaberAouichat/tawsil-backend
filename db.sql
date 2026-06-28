@@ -94,6 +94,7 @@ CREATE TABLE Drivers (
     is_documents_verified BOOLEAN      DEFAULT FALSE,
     is_available          BOOLEAN      DEFAULT FALSE,
     availability          ENUM('available','busy','offline') DEFAULT 'offline',
+    approval_welcome_shown BOOLEAN     DEFAULT FALSE,
     rating                DECIMAL(3,2) DEFAULT 0.0,
     vehicle_info          TEXT,
     driver_type           ENUM('normal_driver','pro_transporter') NOT NULL DEFAULT 'normal_driver',
@@ -103,6 +104,9 @@ CREATE TABLE Drivers (
     FOREIGN KEY (reviewed_by)   REFERENCES Users(id)             ON DELETE SET NULL
 );
 
+-- =========================================================
+-- Migration for existing databases:
+-- ALTER TABLE Drivers ADD COLUMN approval_welcome_shown BOOLEAN DEFAULT FALSE;
 -- =========================================================
 -- 6. Vehicles
 -- =========================================================
@@ -519,29 +523,9 @@ CREATE TABLE AuthorityComplianceReports (
     FOREIGN KEY (generated_by) REFERENCES Authorities(user_id) ON DELETE SET NULL
 );
 
--- =========================================================
--- 23. Pricing Analytics
--- =========================================================
-CREATE TABLE PricingAnalytics (
-    id              VARCHAR(36) PRIMARY KEY,
-    delivery_id     VARCHAR(36) NOT NULL,
-    mode            ENUM('CROSS_SHIPPING','PROFESSIONAL_DELIVERY') NOT NULL,
-    distance_km     DECIMAL(10,2) NOT NULL,
-    base_fee        DECIMAL(10,2) NOT NULL DEFAULT 0,
-    distance_fee    DECIMAL(10,2) NOT NULL DEFAULT 0,
-    size_surcharge  DECIMAL(10,2) NOT NULL DEFAULT 0,
-    weight_surcharge DECIMAL(10,2) NOT NULL DEFAULT 0,
-    deviation_cost  DECIMAL(10,2) NOT NULL DEFAULT 0,
-    urgent_surcharge DECIMAL(10,2) NOT NULL DEFAULT 0,
-    estimated_price DECIMAL(10,2) NOT NULL,
-    final_price     DECIMAL(10,2),
-    driver_score    DECIMAL(5,4),
-    selected_driver_id VARCHAR(36),
-    is_best_deal    BOOLEAN DEFAULT FALSE,
-    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (delivery_id) REFERENCES Deliveries(id) ON DELETE CASCADE,
-    FOREIGN KEY (selected_driver_id) REFERENCES Drivers(participant_id) ON DELETE SET NULL
-);
+-- PricingAnalytics table was removed because the codebase only
+-- references DeliveryPricingAnalytics (see services/delivery.service.js
+-- and controllers/delivery.workflow.js). This avoids schema duplication.
 
 -- =========================================================
 -- 17. DeliveryPricingAnalytics
@@ -594,6 +578,21 @@ CREATE TABLE IF NOT EXISTS DeliveryEarningsSnapshot (
 );
 
 -- =========================================================
+-- 20. DriverStatusHistory
+-- =========================================================
+CREATE TABLE DriverStatusHistory (
+    id          VARCHAR(36) PRIMARY KEY,
+    driver_id   VARCHAR(36) NOT NULL,
+    old_status  VARCHAR(50) DEFAULT NULL,
+    new_status  VARCHAR(50) NOT NULL,
+    changed_by  VARCHAR(36) DEFAULT NULL,
+    comment     TEXT DEFAULT NULL,
+    changed_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (driver_id) REFERENCES Drivers(participant_id) ON DELETE CASCADE,
+    FOREIGN KEY (changed_by) REFERENCES Users(id) ON DELETE SET NULL
+);
+
+-- =========================================================
 -- Indexes
 -- =========================================================
 CREATE INDEX idx_users_blocked_suspended              ON Users(is_blocked, is_suspended);
@@ -620,6 +619,30 @@ CREATE INDEX idx_authority_complaints_status          ON AuthorityComplaints(sta
 CREATE INDEX idx_authority_complaints_delivery        ON AuthorityComplaints(delivery_id);
 CREATE INDEX idx_authority_compliance_reports_status  ON AuthorityComplianceReports(status, type, created_at);
 CREATE INDEX idx_user_tokens_lookup                   ON UserTokens(user_id, type, expires_at);
+CREATE INDEX idx_driver_status_history_driver         ON DriverStatusHistory(driver_id, changed_at);
+
+-- ---------------------------------------------------------
+-- Delivery Ratings
+-- ---------------------------------------------------------
+CREATE TABLE DeliveryRatings (
+    id                    VARCHAR(36) PRIMARY KEY,
+    delivery_id           VARCHAR(36) NOT NULL UNIQUE,
+    driver_id             VARCHAR(36) NOT NULL,
+    client_id             VARCHAR(36) NOT NULL,
+    communication_rating  TINYINT UNSIGNED NOT NULL CHECK (communication_rating BETWEEN 1 AND 5),
+    package_rating        TINYINT UNSIGNED NOT NULL CHECK (package_rating BETWEEN 1 AND 5),
+    delivery_time_rating  TINYINT UNSIGNED NOT NULL CHECK (delivery_time_rating BETWEEN 1 AND 5),
+    average_rating        DECIMAL(3,2) NOT NULL,
+    comment               TEXT,
+    created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (delivery_id) REFERENCES Deliveries(id) ON DELETE CASCADE,
+    FOREIGN KEY (driver_id)   REFERENCES Drivers(participant_id) ON DELETE CASCADE,
+    FOREIGN KEY (client_id)   REFERENCES Requesters(participant_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_delivery_ratings_driver      ON DeliveryRatings(driver_id);
+CREATE INDEX idx_delivery_ratings_delivery    ON DeliveryRatings(delivery_id);
 
 -- =========================================================
 -- End of Schema

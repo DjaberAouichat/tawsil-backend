@@ -30,3 +30,15 @@ export const createTripSchema = z.object({
 export const updateTripStatusSchema = z.object({
   status: z.enum(["planned", "active", "completed", "cancelled"]),
 })
+
+export const updateTripSchema = z.object({
+  title: z.string().max(120).optional(),
+  origin: pointSchema.optional(),
+  destination: pointSchema.optional(),
+  departureTime: z.coerce.date().optional(),
+  expectedArrivalTime: z.coerce.date().optional(),
+  maxDeliveries: z.number().int().min(1).max(50).optional(),
+  vehicleType: z.enum(["standard", "comfort", "premium", "van"]).optional(),
+  acceptedPackageSize: z.enum(["small_only", "up_to_medium", "up_to_large", "any"]).optional(),
+  notes: z.string().max(500).optional(),
+})

@@ -2,11 +2,16 @@ import crypto from "crypto"
 import { getPool, withTransaction, exec } from "../lib/db.js"
 import { findDriverByUserId } from "../models/driver.model.js"
 import {
+  autoCompleteExpiredTrips,
+  checkAndCompleteTrip,
   countAvailableTrips,
   createTrip as createTripRecord,
+  deleteTrip as deleteTripRecord,
   findTripById,
+  findOverlappingTrips,
   listAvailableTrips as listAvailableTripRecords,
   listDriverTrips as listDriverTripRecords,
+  updateTripDetails,
   updateTripStatus as updateTripStatusRecord,
 } from "../models/trip.model.js"
 import { sendSuccess, createError } from "../utils/response.js"
@@ -205,6 +210,22 @@ export const createTrip = async (req, res, next) => {
       return next(createError(403, "Driver account is not verified for trips"))
     }
 
+    const departureTime = new Date(req.body.departureTime)
+    const expectedArrivalTime = req.body.expectedArrivalTime ? new Date(req.body.expectedArrivalTime) : null
+
+    const overlapping = await findOverlappingTrips(
+      null,
+      req.user.id,
+      departureTime,
+      expectedArrivalTime,
+    )
+    if (overlapping) {
+      return next(createError(
+        409,
+        "Vous avez déjà un trajet planifié ou en cours pendant cette période. Terminez-le ou choisissez un autre horaire.",
+      ))
+    }
+
     const tripId = crypto.randomUUID()
     const routeData = req.body.route || null
     const routeGeometry = routeData?.points || null
@@ -218,8 +239,8 @@ export const createTrip = async (req, res, next) => {
         title: req.body.title,
         origin: req.body.origin,
         destination: req.body.destination,
-        departureTime: req.body.departureTime,
-        expectedArrivalTime: req.body.expectedArrivalTime || null,
+        departureTime,
+        expectedArrivalTime: expectedArrivalTime || null,
         maxDeliveries: req.body.maxDeliveries || 3,
         availableCapacity: req.body.maxDeliveries || 3,
         vehicleType: req.body.vehicleType || null,
@@ -279,6 +300,43 @@ export const listDriverTrips = async (req, res, next) => {
     })
 
     return sendSuccess(res, 200, "Trips fetched successfully", { trips })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export const listDriverActiveTrips = async (req, res, next) => {
+  try {
+    const driver = await findDriverByUserId(null, req.user.id)
+    if (!driver) {
+      return next(createError(404, "Driver profile not found"))
+    }
+
+    const trips = await listDriverTripRecords(null, req.user.id, {
+      status: null,
+    })
+
+    const activeTrips = trips.filter(
+      (t) => t.status === "planned" || t.status === "active",
+    )
+
+    // Enrich with delivery counts
+    const enriched = await Promise.all(activeTrips.map(async (trip) => {
+      const countRows = await exec(
+        null,
+        `SELECT COUNT(*) AS total FROM Deliveries WHERE trip_id = ?`,
+        [trip.id],
+      )
+      return {
+        ...trip,
+        totalDeliveries: Number(countRows[0]?.total || 0),
+      }
+    }))
+
+    return sendSuccess(res, 200, "Active trips fetched successfully", {
+      activeTrips: enriched,
+      hasActiveTrip: enriched.length > 0,
+    })
   } catch (error) {
     next(error)
   }
@@ -418,7 +476,86 @@ export const updateTripStatus = async (req, res, next) => {
     }
 
     const updated = await updateTripStatusRecord(null, tripId, status)
+
+    // If status changed to completed or cancelled, check if auto-complete is needed for other trips
+    if (status === "completed" || status === "cancelled") {
+      const driverTrips = await listDriverTripRecords(null, trip.driverId, { status: null })
+      const activeTrips = driverTrips.filter((t) => t.id !== tripId && (t.status === "planned" || t.status === "active"))
+      for (const t of activeTrips) {
+        await checkAndCompleteTrip(null, t.id).catch(() => {})
+      }
+    }
+
     return sendSuccess(res, 200, "Trip status updated successfully", { trip: updated })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export const updateTrip = async (req, res, next) => {
+  try {
+    const { tripId } = req.params
+
+    const trip = await findTripById(null, tripId)
+    if (!trip) {
+      return next(createError(404, "Trip not found"))
+    }
+
+    if (trip.driverId !== req.user.id) {
+      return next(createError(403, "You are not authorized to update this trip"))
+    }
+
+    const isActiveOrPlanned = trip.status === "planned" || trip.status === "active"
+
+    if (isActiveOrPlanned) {
+      const protectedFields = [
+        req.body.origin !== undefined && "origin",
+        req.body.destination !== undefined && "destination",
+        req.body.departureTime !== undefined && "departureTime",
+      ].filter(Boolean)
+
+      if (protectedFields.length > 0) {
+        return next(createError(
+          400,
+          `Vous ne pouvez pas modifier les champs suivants pour un trajet ${trip.status} : ${protectedFields.join(", ")}`,
+        ))
+      }
+    }
+
+    const updates = {}
+    if (req.body.title !== undefined) updates.title = req.body.title
+    if (req.body.maxDeliveries !== undefined) updates.max_deliveries = req.body.maxDeliveries
+    if (req.body.vehicleType !== undefined) updates.vehicle_type = req.body.vehicleType
+    if (req.body.acceptedPackageSize !== undefined) updates.accepted_package_size = req.body.acceptedPackageSize
+    if (req.body.notes !== undefined) updates.notes = req.body.notes
+    if (req.body.expectedArrivalTime !== undefined) updates.expected_arrival_time = req.body.expectedArrivalTime
+
+    const updated = await updateTripDetails(null, tripId, updates)
+    return sendSuccess(res, 200, "Trip updated successfully", { trip: updated })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export const deleteTrip = async (req, res, next) => {
+  try {
+    const { tripId } = req.params
+
+    const trip = await findTripById(null, tripId)
+    if (!trip) {
+      return next(createError(404, "Trip not found"))
+    }
+
+    if (trip.driverId !== req.user.id) {
+      return next(createError(403, "You are not authorized to delete this trip"))
+    }
+
+    if (trip.status === "active") {
+      return next(createError(400, "Vous ne pouvez pas supprimer un trajet en cours (statut 'active'). Terminez-le d'abord."))
+    }
+
+    await deleteTripRecord(null, tripId)
+    return sendSuccess(res, 200, "Trip deleted successfully", { tripId })
   } catch (error) {
     next(error)
   }

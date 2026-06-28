@@ -17,8 +17,7 @@ import {
   updateDeliveryStatus as updateDeliveryStatusModel,
 } from "../models/delivery.model.js"
 import { findTripById } from "../models/trip.model.js"
-import { findUserById } from "../models/user.model.js"
-import { sendDeliveryOtpEmail } from "../utils/email.utils.js"
+import { checkAndCompleteTrip } from "../models/trip.model.js"
 import { sendSuccess, createError } from "../utils/response.js"
 import { sendNewDeliveryNearbyNotifications } from "../services/notification.service.js"
 import { toBoundedPositiveInteger, toSqlDateTime, getRequestBaseUrl } from "../utils/helpers.js"
@@ -1011,6 +1010,8 @@ export const detachDeliveryFromTrip = async (req, res, next) => {
 
 export const cancelDelivery = async (req, res, next) => {
   try {
+    let originalTripId = null
+
     const result = await withTransaction(async (connection) => {
       const rows = await exec(
         connection,
@@ -1059,6 +1060,10 @@ export const cancelDelivery = async (req, res, next) => {
 
       const nextStatus = isAssignedDriver ? DELIVERY_STATUS.CANCELLED_BY_DRIVER : DELIVERY_STATUS.CANCELLED_BY_USER
 
+      if (row.trip_id) {
+        originalTripId = row.trip_id
+      }
+
       if (row.assigned_driver_id) {
         await exec(connection, `UPDATE Drivers SET is_available = 1 WHERE participant_id = ?`, [row.assigned_driver_id])
       }
@@ -1095,6 +1100,11 @@ export const cancelDelivery = async (req, res, next) => {
 
       return findDeliveryById(connection, req.params.deliveryId, { includeDriver: true, includeRequester: true, includeTrip: true })
     })
+
+    // Auto-complete the trip if no more active deliveries
+    if (originalTripId) {
+      checkAndCompleteTrip(null, originalTripId).catch(() => {})
+    }
 
     if (result.status === DELIVERY_STATUS.CANCELLED_BY_DRIVER) {
       notifyClient(
@@ -1345,12 +1355,6 @@ export const acceptDelivery = async (req, res, next) => {
     const driverId = req.user.id
     const requestedTripId = req.body.tripId || null
 
-    const { ttlMinutes } = getOtpConfig()
-    const otp = generateOtpCode()
-    const otpHash = await bcrypt.hash(String(otp), 10)
-    const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000)
-    const expiresSql = toSqlDateTime(expiresAt)
-
     let requesterId = null
     let originalTripId = null
 
@@ -1375,7 +1379,7 @@ export const acceptDelivery = async (req, res, next) => {
       if (deliveryRow.assigned_driver_id) {
         if (deliveryRow.assigned_driver_id === driverId) {
           const current = await findDeliveryById(connection, deliveryId, { includeDriver: true, includeRequester: false, includeTrip: true })
-          return { delivery: current, otp: null }
+          return { delivery: current }
         }
 
         throw createError(409, "Delivery has already been claimed by another driver")
@@ -1424,7 +1428,8 @@ export const acceptDelivery = async (req, res, next) => {
       if (tripId) {
         const tripRows = await exec(
           connection,
-          `SELECT id, driver_id, status, available_capacity, accepted_package_size
+          `SELECT id, driver_id, status, available_capacity, accepted_package_size,
+                  departure_time, expected_arrival_time
            FROM Trips
            WHERE id = ?
            FOR UPDATE`,
@@ -1455,6 +1460,47 @@ export const acceptDelivery = async (req, res, next) => {
           throw createError(400, "Package size is not compatible with this trip")
         }
 
+        // Check that the delivery can be completed before the trip's expected arrival
+        if (tripRow.expected_arrival_time) {
+          const tripArrival = new Date(tripRow.expected_arrival_time)
+          const now = new Date()
+          if (tripArrival <= now) {
+            throw createError(400, "Le trajet est déjà terminé. Vous ne pouvez pas accepter de livraison.")
+          }
+        }
+
+        // Check route compatibility (wilaya-level)
+        const tripLocRows = await exec(
+          connection,
+          `SELECT type, address FROM TripLocations WHERE trip_id = ?`,
+          [tripId],
+        )
+        const delLocRows = await exec(
+          connection,
+          `SELECT type, address FROM DeliveryLocations WHERE delivery_id = ?`,
+          [deliveryId],
+        )
+
+        const extractWilaya = (addr) => {
+          if (!addr) return ""
+          const parts = addr.split(",").map((s) => s.trim()).filter(Boolean)
+          return parts.length > 0 ? parts[parts.length - 1].toLowerCase() : ""
+        }
+
+        const tripOriginWilaya = extractWilaya(tripLocRows.find((l) => l.type === "START")?.address || "")
+        const tripDestWilaya = extractWilaya(tripLocRows.find((l) => l.type === "END")?.address || "")
+        const delPickupWilaya = extractWilaya(delLocRows.find((l) => l.type === "PICKUP")?.address || "")
+        const delDropoffWilaya = extractWilaya(delLocRows.find((l) => l.type === "DROPOFF")?.address || "")
+
+        const wilayaMatch = (a, b) => a && b && a === b
+
+        if (tripOriginWilaya && delPickupWilaya && !wilayaMatch(tripOriginWilaya, delPickupWilaya)) {
+          throw createError(400, "La livraison n'est pas sur l'itinéraire de votre trajet (wilaya de départ incompatible).")
+        }
+        if (tripDestWilaya && delDropoffWilaya && !wilayaMatch(tripDestWilaya, delDropoffWilaya)) {
+          throw createError(400, "La livraison n'est pas sur l'itinéraire de votre trajet (wilaya de destination incompatible).")
+        }
+
         const updateTripResult = await exec(
           connection,
           `UPDATE Trips SET available_capacity = available_capacity - 1 WHERE id = ? AND available_capacity > 0`,
@@ -1478,17 +1524,6 @@ export const acceptDelivery = async (req, res, next) => {
       await touchTimeline(connection, deliveryId, STATUS_TO_TIMELINE_COLUMN[DELIVERY_STATUS.ACCEPTED])
 
       await exec(connection, `UPDATE Drivers SET is_available = 0 WHERE participant_id = ?`, [driverId])
-
-      await exec(
-        connection,
-        `INSERT INTO DeliveryOtps (id, delivery_id, otp_hash, expires_at, attempts)
-         VALUES (?, ?, ?, ?, 0)
-         ON DUPLICATE KEY UPDATE
-           otp_hash = VALUES(otp_hash),
-           expires_at = VALUES(expires_at),
-           attempts = 0`,
-        [crypto.randomUUID(), deliveryId, otpHash, expiresSql],
-      )
 
       const delivery = await findDeliveryById(connection, deliveryId, {
         includeDriver: true,
@@ -1542,18 +1577,10 @@ export const acceptDelivery = async (req, res, next) => {
         [crypto.randomUUID(), deliveryId, driverId, netProfitVal, JSON.stringify(snapshotData)],
       )
 
-      return { delivery, otp, earningsSnapshot: snapshotData }
+      return { delivery, earningsSnapshot: snapshotData }
     })
 
     const acceptedDelivery = txResult.delivery
-
-    const requester = requesterId ? await findUserById(null, requesterId) : null
-    const emailOk = requester?.email ? await sendDeliveryOtpEmail(requester.email, txResult.otp, deliveryId) : false
-
-    if (!emailOk) {
-      console.warn(`Delivery OTP email could not be sent for delivery ${deliveryId}. Keeping the acceptance in place.`)
-    }
-
     const driverName = [
       acceptedDelivery.assignedDriver?.user?.firstName,
       acceptedDelivery.assignedDriver?.user?.lastName,
@@ -1807,6 +1834,8 @@ export const updateDeliveryProgress = async (req, res, next) => {
       return next(createError(400, "status is required"))
     }
 
+    let generatedOtp = null
+
     const updated = await withTransaction(async (connection) => {
       const rows = await exec(
         connection,
@@ -1833,6 +1862,26 @@ export const updateDeliveryProgress = async (req, res, next) => {
       if (row.status !== status) {
         await updateDeliveryStatusModel(connection, req.params.deliveryId, status, row.status, req.user.id)
         await touchTimeline(connection, req.params.deliveryId, STATUS_TO_TIMELINE_COLUMN[status])
+      }
+
+      if (status === DELIVERY_STATUS.ARRIVED_DROPOFF) {
+        const { ttlMinutes } = getOtpConfig()
+        const otp = generateOtpCode()
+        const otpHash = await bcrypt.hash(String(otp), 10)
+        const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000)
+        const expiresSql = toSqlDateTime(expiresAt)
+
+        await exec(
+          connection,
+          `INSERT INTO DeliveryOtps (id, delivery_id, otp_hash, expires_at, attempts)
+           VALUES (?, ?, ?, ?, 0)
+           ON DUPLICATE KEY UPDATE
+             otp_hash = VALUES(otp_hash),
+             expires_at = VALUES(expires_at),
+             attempts = 0`,
+          [crypto.randomUUID(), req.params.deliveryId, otpHash, expiresSql],
+        )
+        generatedOtp = otp
       }
 
       if (status === DELIVERY_STATUS.FAILED_DELIVERY) {
@@ -1881,6 +1930,31 @@ export const updateDeliveryProgress = async (req, res, next) => {
           deliveryId: updated.id,
         },
       )
+    }
+
+    if (status === DELIVERY_STATUS.ARRIVED_DROPOFF && generatedOtp) {
+      const otpMessage = `Votre code de confirmation est : ${generatedOtp}. Communiquez ce code au livreur afin de confirmer la livraison.`
+
+      notifyClient(
+        updated.senderId,
+        "notification:delivery_otp",
+        { deliveryId: updated.id, otpCode: generatedOtp },
+        {
+          recipient: updated.senderId,
+          title: "Code de confirmation de livraison",
+          message: otpMessage,
+          type: "delivery_otp",
+          reference: updated.id,
+          referenceModel: "Delivery",
+          deliveryId: updated.id,
+          sendEmail: false,
+        },
+      )
+    }
+
+    // Auto-complete trip if delivery reached a terminal status
+    if (updated?.tripId && isTerminalDeliveryStatus(updated.status)) {
+      checkAndCompleteTrip(null, updated.tripId).catch(() => {})
     }
 
     return sendSuccess(res, 200, "Delivery progress updated successfully", {
@@ -2031,17 +2105,24 @@ export const markDeliveryCompleted = async (req, res, next) => {
         deliveryId: updated.id,
         type: "rate_delivery",
         referenceId: updated.id,
+        actionUrl: "/rate-delivery/${updated.id}",
       },
       {
         recipient: updated.senderId,
-        title: "Delivery completed",
-        message: "Votre colis a été livré avec succès! Notez votre expérience.",
-        type: "delivered",
+        title: "Votre livraison est terminée \u2B50",
+        message: "Merci d'avoir utilisé TawsilGO. Prenez quelques secondes pour \u00E9valuer votre exp\u00E9rience.",
+        type: "rate_delivery",
         reference: updated.id,
         referenceModel: "Delivery",
         deliveryId: updated.id,
+        actionUrl: "/rate-delivery/${updated.id}",
       },
     )
+
+    // Auto-complete trip if all deliveries are done
+    if (updated?.tripId) {
+      checkAndCompleteTrip(null, updated.tripId).catch(() => {})
+    }
 
     return sendSuccess(res, 200, "Delivery completed successfully", {
       delivery: updated,
@@ -2313,6 +2394,96 @@ export const updatePaymentStatus = async (req, res, next) => {
     })
 
     return sendSuccess(res, 200, "Payment status updated successfully", { delivery: updated })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export const listDriverAvailablePackagesByWilaya = async (req, res, next) => {
+  try {
+    const userRows = await exec(null, `SELECT city FROM Users WHERE id = ?`, [req.user.id])
+    const driverCity = userRows[0]?.city
+    if (!driverCity) {
+      return sendSuccess(res, 200, "Available packages fetched successfully", { deliveries: [], total: 0 })
+    }
+
+    const driverLocation = await getDriverLocation(null, req.user.id)
+    const hasLocation = driverLocation && driverLocation.latitude != null && driverLocation.longitude != null
+    const driverLat = hasLocation ? Number(driverLocation.latitude) : null
+    const driverLng = hasLocation ? Number(driverLocation.longitude) : null
+
+    const rows = await exec(
+      null,
+      `SELECT d.id,
+              ANY_VALUE(pl.latitude) AS pickup_lat,
+              ANY_VALUE(pl.longitude) AS pickup_lng,
+              ANY_VALUE(dp.price) AS price,
+              ANY_VALUE(d.created_at) AS created_at,
+              ANY_VALUE(d.package_weight_kg) AS weight
+       FROM Deliveries d
+       LEFT JOIN DeliveryRejections r ON r.delivery_id = d.id AND r.driver_id = ?
+       LEFT JOIN DeliveryPricing dp ON dp.delivery_id = d.id
+       LEFT JOIN DeliveryLocations pl ON pl.delivery_id = d.id AND pl.type = 'PICKUP'
+       WHERE d.status = 'Pending'
+         AND d.assigned_driver_id IS NULL
+         AND r.id IS NULL
+         AND (d.trip_id IS NULL OR d.trip_id IN (
+           SELECT t.id FROM Trips t WHERE t.driver_id = ? AND t.status IN ('planned','active')
+         ))
+         AND pl.address LIKE ?
+       GROUP BY d.id
+       ORDER BY d.created_at DESC
+       LIMIT 500`,
+      [req.user.id, req.user.id, `%${driverCity}%`],
+    )
+
+    const candidates = []
+    for (const row of rows) {
+      let distanceKm = null
+      if (hasLocation && row.pickup_lat != null) {
+        const dist = distanceMeters(
+          [Number(row.pickup_lng), Number(row.pickup_lat)],
+          [driverLng, driverLat],
+        )
+        if (dist != null) distanceKm = Math.round((dist / 1000) * 100) / 100
+      }
+      candidates.push({
+        id: row.id,
+        distanceKm,
+        price: Number(row.price || 0),
+        createdAt: row.created_at,
+      })
+    }
+
+    candidates.sort((a, b) => {
+      const distA = a.distanceKm ?? Infinity
+      const distB = b.distanceKm ?? Infinity
+      if (distA !== distB) return distA - distB
+      const dateA = a.createdAt ? new Date(a.createdAt).getTime() : 0
+      const dateB = b.createdAt ? new Date(b.createdAt).getTime() : 0
+      if (dateA !== dateB) return dateB - dateA
+      return b.price - a.price
+    })
+
+    const deliveries = []
+    for (const c of candidates) {
+      const delivery = await findDeliveryById(null, c.id, {
+        includeDriver: false,
+        includeRequester: false,
+        includeTrip: false,
+      })
+      if (delivery) {
+        deliveries.push({
+          ...delivery,
+          distanceKm: c.distanceKm,
+        })
+      }
+    }
+
+    return sendSuccess(res, 200, "Available packages fetched successfully", {
+      deliveries,
+      total: deliveries.length,
+    })
   } catch (error) {
     next(error)
   }

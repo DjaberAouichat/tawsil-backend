@@ -1,7 +1,7 @@
 ﻿import { getPool, exec } from "../lib/db.js"
 import { sendSuccess, createError } from "../utils/response.js"
 import { createNotification } from "../utils/notification.utils.js"
-import { updateDriverReviewStatus } from "../models/driver.model.js"
+import { updateDriverReviewStatus, insertDriverStatusHistory, listDriverStatusHistory } from "../models/driver.model.js"
 import { addDriverVerificationTimelineEvent, listDriverVerificationTimeline } from "../models/driver.model.js"
 import { listAllSettings, upsertSetting } from "../models/settings.model.js"
 import { insertDeliveryStatusHistory } from "../models/delivery.model.js"
@@ -672,6 +672,9 @@ export const blockAccount = async (req, res, next) => {
     if (!rows[0]) return next(createError(404, "User not found"))
     if (rows[0].is_blocked) return next(createError(409, "Account is already blocked"))
 
+    const driverRows = await exec(null, `SELECT participant_id, review_status FROM Drivers WHERE participant_id = ? LIMIT 1`, [userId])
+    const oldStatus = driverRows[0]?.review_status || null
+
     await exec(
       null,
       `UPDATE Users SET is_blocked = 1, blocked_at = NOW(), token_version = COALESCE(token_version, 0) + 1 WHERE id = ?`,
@@ -680,6 +683,14 @@ export const blockAccount = async (req, res, next) => {
 
     await exec(null, `DELETE FROM UserTokens WHERE user_id = ?`, [userId])
     await exec(null, `UPDATE Drivers SET review_status = 'blocked', verification_status = 'blocked', review_reason = ?, reviewed_by = ?, reviewed_at = NOW(), approved_at = NULL, is_documents_verified = 0, is_available = 0, availability = 'offline' WHERE participant_id = ?`, [reason || 'blocked_by_admin', req.user.id, userId])
+
+    await insertDriverStatusHistory(null, {
+      driverId: userId,
+      oldStatus,
+      newStatus: 'blocked',
+      changedBy: req.user.id,
+      comment: reason || 'blocked_by_admin',
+    })
 
     return sendSuccess(res, 200, "Account blocked successfully", { userId, reason: reason || null })
   } catch (error) {
@@ -701,6 +712,14 @@ export const unblockAccount = async (req, res, next) => {
     )
 
     await exec(null, `UPDATE Drivers SET review_status = 'pending', verification_status = 'pending', review_reason = NULL, reviewed_by = ?, reviewed_at = NOW(), approved_at = NULL WHERE participant_id = ? AND review_status = 'blocked'`, [req.user.id, userId])
+
+    await insertDriverStatusHistory(null, {
+      driverId: userId,
+      oldStatus: 'blocked',
+      newStatus: 'pending',
+      changedBy: req.user.id,
+      comment: 'unblocked_by_admin',
+    })
 
     return sendSuccess(res, 200, "Account unblocked successfully", { userId })
   } catch (error) {
@@ -859,12 +878,13 @@ export const updateDriverReviewStatusHandler = async (req, res, next) => {
 
     const rows = await exec(
       null,
-      `SELECT participant_id FROM Drivers WHERE participant_id = ? LIMIT 1`,
+      `SELECT participant_id, review_status FROM Drivers WHERE participant_id = ? LIMIT 1`,
       [driverId],
     )
     if (!rows[0]) {
       return next(createError(404, "Driver not found"))
     }
+    const oldStatus = rows[0].review_status
 
     const isDocumentsVerified = reviewStatus === "approved"
       ? true
@@ -882,7 +902,10 @@ export const updateDriverReviewStatusHandler = async (req, res, next) => {
       isDocumentsVerified,
       isAvailable: reviewStatus === "approved" ? true : reviewStatus === "pending" ? undefined : false,
       availability: reviewStatus === "approved" ? "available" : reviewStatus === "pending" ? undefined : "offline",
+      approvalWelcomeShown: reviewStatus === "approved" ? false : undefined,
     })
+
+    console.log(`[ADMIN] Driver ${driverId} review ${oldStatus} -> ${reviewStatus}, approvalWelcomeShown ${reviewStatus === "approved" ? "reset to false" : "unchanged"}`)
 
     await addDriverVerificationTimelineEvent(null, {
       driverId,
@@ -904,6 +927,14 @@ export const updateDriverReviewStatusHandler = async (req, res, next) => {
     )
 
     await sendDriverReviewNotification(driverId, reviewStatus, reason || null)
+
+    await insertDriverStatusHistory(null, {
+      driverId,
+      oldStatus: oldStatus || null,
+      newStatus: reviewStatus,
+      changedBy: req.user.id,
+      comment: reason || null,
+    })
 
     return sendSuccess(res, 200, "Driver review status updated successfully", {
       driverId,
@@ -948,6 +979,33 @@ export const getDriverVerificationTimelineHandler = async (req, res, next) => {
         limit,
         offset,
       },
+    })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export const getDriverStatusHistoryHandler = async (req, res, next) => {
+  try {
+    const { driverId } = req.params
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 200)
+    const offset = parseInt(req.query.offset, 10) || 0
+
+    const rows = await exec(
+      null,
+      `SELECT participant_id FROM Drivers WHERE participant_id = ? LIMIT 1`,
+      [driverId],
+    )
+    if (!rows[0]) {
+      return next(createError(404, "Driver not found"))
+    }
+
+    const history = await listDriverStatusHistory(null, driverId, { limit, offset })
+
+    return sendSuccess(res, 200, "Driver status history fetched successfully", {
+      driverId,
+      history,
+      pagination: { limit, offset },
     })
   } catch (error) {
     next(error)
