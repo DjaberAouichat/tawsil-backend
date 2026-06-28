@@ -60,7 +60,7 @@ import {
   savePricingAnalytics,
 } from "../services/delivery.service.js"
 import { distanceMeters as haversineDistance } from "../utils/maps.js"
-import { emitToUser } from "../socket/index.js"
+import { emitToUser, getIO } from "../socket/index.js"
 
 const ACTIVE_DRIVER_STATUSES = [
   DELIVERY_STATUS.ACCEPTED,
@@ -1714,6 +1714,31 @@ export const updateDriverLiveLocation = async (req, res, next) => {
       latitude: lat,
       longitude: lng,
     })
+
+    // Broadcast to clients watching this driver's active deliveries
+    try {
+      const io = getIO()
+      if (io) {
+        const activeRows = await exec(
+          null,
+          `SELECT id, requester_id FROM Deliveries
+           WHERE assigned_driver_id = ?
+             AND status IN ('Accepted','DriverArrivedPickup','PickedUp','InTransit','ArrivedDropoff')`,
+          [req.user.id],
+        )
+        for (const row of activeRows) {
+          io.to(`client:${row.requester_id}`).emit("delivery:driver_location", {
+            deliveryId: row.id,
+            coordinates: [lng, lat],
+            heading: null,
+            speed: null,
+            accuracy: null,
+            isLowAccuracy: false,
+            timestamp: new Date().toISOString(),
+          })
+        }
+      }
+    } catch (_) {}
 
     return sendSuccess(res, 200, "Driver location updated successfully", {
       currentLocation: {

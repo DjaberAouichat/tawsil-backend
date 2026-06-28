@@ -68,17 +68,21 @@ export const initSocket = (httpServer) => {
       try {
         const { lat, lng, accuracy, heading, speed } = payload || {}
 
-        if (typeof accuracy !== "number" || accuracy >= 50) {
-          socket.emit("location:low_accuracy", { accuracy })
+        const accuracyNum = typeof accuracy === "number" ? accuracy : 999
+
+        // Hard‑reject only if accuracy >= 200 or coords outside Algeria
+        if (accuracyNum >= 200) {
+          socket.emit("location:low_accuracy", { accuracy: accuracyNum })
           return
         }
 
         if (typeof lat !== "number" || typeof lng !== "number" ||
             lat < 18 || lat > 38 || lng < -9 || lng > 12) {
-          socket.emit("location:low_accuracy", { accuracy })
+          socket.emit("location:low_accuracy", { accuracy: accuracyNum })
           return
         }
 
+        const isLowAccuracy = accuracyNum >= 100
         const id = crypto.randomUUID()
         const h = heading != null ? heading : null
         const s = speed != null ? speed : null
@@ -87,7 +91,7 @@ export const initSocket = (httpServer) => {
           null,
           `INSERT INTO DriverLocationHistory (id, driver_id, latitude, longitude, accuracy, heading, speed)
            VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [id, socket.userId, lat, lng, accuracy, h, s],
+          [id, socket.userId, lat, lng, accuracyNum, h, s],
         )
 
         await exec(
@@ -101,7 +105,7 @@ export const initSocket = (httpServer) => {
              heading = VALUES(heading),
              speed = VALUES(speed),
              \`timestamp\` = CURRENT_TIMESTAMP`,
-          [socket.userId, lat, lng, accuracy, h, s],
+          [socket.userId, lat, lng, accuracyNum, h, s],
         )
 
         await exec(
@@ -118,12 +122,12 @@ export const initSocket = (httpServer) => {
           [socket.userId, socket.userId],
         )
 
-        if (accuracy < 30) {
+        if (!isLowAccuracy) {
           io.to("admin").emit("driver:location_high_accuracy", {
             driverId: socket.userId,
             lat,
             lng,
-            accuracy,
+            accuracy: accuracyNum,
             heading: h,
             speed: s,
             timestamp: new Date().toISOString(),
@@ -142,10 +146,11 @@ export const initSocket = (httpServer) => {
           for (const row of activeRows) {
             io.to(`client:${row.requester_id}`).emit("delivery:driver_location", {
               deliveryId: row.id,
-              lat,
-              lng,
+              coordinates: [lng, lat],
               heading: h,
               speed: s,
+              accuracy: accuracyNum,
+              isLowAccuracy,
               timestamp: new Date().toISOString(),
             })
           }
@@ -155,7 +160,7 @@ export const initSocket = (httpServer) => {
           }
         }
 
-        socket.emit("location:confirmed", { accuracy })
+        socket.emit("location:confirmed", { accuracy: accuracyNum })
       } catch (error) {
         console.error("[socket] driver:location_update error:", error)
         socket.emit("location:low_accuracy", { accuracy: payload?.accuracy })
