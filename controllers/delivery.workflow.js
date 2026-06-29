@@ -613,7 +613,10 @@ export const getDeliveryById = async (req, res, next) => {
       return next(createError(404, "Delivery not found"))
     }
 
-    assertCanAccessDelivery({ delivery, user: req.user })
+    // Allow drivers to view pending available deliveries (e.g. from notification)
+    if (!(req.user.role === "driver" && delivery.status === "Pending" && !delivery.assignedDriverId)) {
+      assertCanAccessDelivery({ delivery, user: req.user })
+    }
 
     let tracking = null
     try {
@@ -1214,7 +1217,7 @@ export const listDriverAvailableDeliveries = async (req, res, next) => {
         if (dist != null) distanceKm = Math.round((dist / 1000) * 100) / 100
       }
 
-      if (filters.radius_km != null && (distanceKm == null || distanceKm > Number(filters.radius_km))) {
+      if (hasLocation && filters.radius_km != null && distanceKm != null && distanceKm > Number(filters.radius_km)) {
         continue
       }
 
