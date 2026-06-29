@@ -4,6 +4,10 @@ import {
   deleteTrip,
   getTripPdf,
   getTripById,
+  getCompatibleDeliveriesForTrip,
+  getJoinRequestsForTrip,
+  acceptJoinRequest,
+  rejectJoinRequest,
   listAvailableTrips,
   listCompatibleTripsForDelivery,
   listDriverTrips,
@@ -32,6 +36,10 @@ router.post("/", authorize("driver"), validateRequest(createTripSchema), asyncHa
 router.patch("/:tripId", authorize("driver"), validateRequest(updateTripSchema), asyncHandler(updateTrip))
 router.delete("/:tripId", authorize("driver"), asyncHandler(deleteTrip))
 router.patch("/:tripId/status", authorize("driver", "admin", "authority"), validateRequest(updateTripStatusSchema), asyncHandler(updateTripStatus))
+router.get("/:tripId/compatible-deliveries", authorize("driver"), asyncHandler(getCompatibleDeliveriesForTrip))
+router.get("/:tripId/join-requests", authorize("driver"), asyncHandler(getJoinRequestsForTrip))
+router.post("/:tripId/join-requests/:deliveryId/accept", authorize("driver"), asyncHandler(acceptJoinRequest))
+router.post("/:tripId/join-requests/:deliveryId/reject", authorize("driver"), asyncHandler(rejectJoinRequest))
 router.get("/:tripId/pdf", asyncHandler(getTripPdf))
 router.get("/:tripId", asyncHandler(getTripById))
 

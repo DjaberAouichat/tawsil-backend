@@ -14,6 +14,8 @@ import {
   updateTripDetails,
   updateTripStatus as updateTripStatusRecord,
 } from "../models/trip.model.js"
+import { findDeliveryById } from "../models/delivery.model.js"
+import { touchTimeline } from "../services/delivery.service.js"
 import { sendSuccess, createError } from "../utils/response.js"
 import { getRequestBaseUrl, toBoundedPositiveInteger } from "../utils/helpers.js"
 import { createNotification } from "../utils/notification.utils.js"
@@ -556,6 +558,287 @@ export const deleteTrip = async (req, res, next) => {
 
     await deleteTripRecord(null, tripId)
     return sendSuccess(res, 200, "Trip deleted successfully", { tripId })
+  } catch (error) {
+    next(error)
+  }
+}
+
+const WILAYA_MATCH_THRESHOLD_KM = Number(process.env.WILAYA_MATCH_THRESHOLD_KM || 50)
+
+const extractWilayaFromAddress = (address) => {
+  if (!address) return ""
+  const parts = address.split(",").map((s) => s.trim()).filter(Boolean)
+  return parts.length > 0 ? parts[parts.length - 1].toLowerCase() : ""
+}
+
+const PACKAGE_SIZE_LEVEL = { small: 1, medium: 2, large: 3, xlarge: 4 }
+const TRIP_ACCEPTED_SIZE_LEVEL = { any: 99, small: 1, medium: 2, large: 3, up_to_medium: 2, up_to_large: 3, small_only: 1 }
+
+const isSizeCompatible = (tripAcceptedSize, deliverySize) => {
+  const tripLevel = TRIP_ACCEPTED_SIZE_LEVEL[String(tripAcceptedSize || "any").toLowerCase()] || 99
+  const deliveryLevel = PACKAGE_SIZE_LEVEL[String(deliverySize || "small").toLowerCase()] || 1
+  return deliveryLevel <= tripLevel
+}
+
+const isWeightCompatible = (deliveryWeightKg, tripMaxWeightKg) => {
+  if (!deliveryWeightKg || !tripMaxWeightKg) return true
+  return Number(deliveryWeightKg) <= Number(tripMaxWeightKg)
+}
+
+export const getCompatibleDeliveriesForTrip = async (req, res, next) => {
+  try {
+    const { tripId } = req.params
+
+    const trip = await findTripById(null, tripId)
+    if (!trip) return next(createError(404, "Trip not found"))
+    if (trip.driverId !== req.user.id) return next(createError(403, "Not your trip"))
+
+    const tripOrigin = trip.origin?.address || ""
+    const tripDest = trip.destination?.address || ""
+    const tripOriginWilaya = extractWilayaFromAddress(tripOrigin)
+    const tripDestWilaya = extractWilayaFromAddress(tripDest)
+    const tripDeparture = trip.departureTime ? new Date(trip.departureTime) : null
+
+    const pendingRows = await exec(
+      null,
+      `SELECT d.id
+       FROM Deliveries d
+       WHERE d.status = 'Pending'
+         AND d.assigned_driver_id IS NULL
+         AND (d.trip_id IS NULL OR d.trip_id = '')
+       ORDER BY d.created_at DESC`,
+    )
+
+    const compatibleDeliveries = []
+    for (const row of pendingRows) {
+      const delivery = await findDeliveryById(null, row.id, {
+        includeDriver: false,
+        includeRequester: true,
+        includeTrip: false,
+      })
+      if (!delivery) continue
+
+      const pickupAddress = delivery.pickup?.address || ""
+      const dropoffAddress = delivery.dropoff?.address || ""
+      const pickupWilaya = extractWilayaFromAddress(pickupAddress)
+      const dropoffWilaya = extractWilayaFromAddress(dropoffAddress)
+
+      const originMatch = tripOriginWilaya && pickupWilaya && tripOriginWilaya === pickupWilaya
+      const destMatch = tripDestWilaya && dropoffWilaya && tripDestWilaya === dropoffWilaya
+
+      if (!originMatch || !destMatch) continue
+
+      const sizeOk = isSizeCompatible(trip.acceptedPackageSize, delivery.packageSizeCategory)
+      if (!sizeOk) continue
+
+      const weightOk = isWeightCompatible(delivery.packageWeightKg, null)
+      if (!weightOk) continue
+
+      compatibleDeliveries.push({
+        ...delivery,
+        compatibility: {
+          originMatch,
+          destMatch,
+          sizeOk,
+          weightOk,
+        },
+      })
+    }
+
+    return sendSuccess(res, 200, "Compatible deliveries fetched successfully", {
+      deliveries: compatibleDeliveries,
+    })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export const getJoinRequestsForTrip = async (req, res, next) => {
+  try {
+    const { tripId } = req.params
+
+    const trip = await findTripById(null, tripId)
+    if (!trip) return next(createError(404, "Trip not found"))
+    if (trip.driverId !== req.user.id) return next(createError(403, "Not your trip"))
+
+    const joinRows = await exec(
+      null,
+      `SELECT d.id
+       FROM Deliveries d
+       WHERE d.trip_id = ?
+         AND d.status = 'Pending'
+         AND d.assigned_driver_id IS NULL
+       ORDER BY d.created_at DESC`,
+      [tripId],
+    )
+
+    const joinRequests = []
+    for (const row of joinRows) {
+      const delivery = await findDeliveryById(null, row.id, {
+        includeDriver: false,
+        includeRequester: true,
+        includeTrip: false,
+      })
+      if (delivery) {
+        joinRequests.push(delivery)
+      }
+    }
+
+    return sendSuccess(res, 200, "Join requests fetched successfully", {
+      joinRequests,
+    })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export const acceptJoinRequest = async (req, res, next) => {
+  try {
+    const { tripId, deliveryId } = req.params
+
+    const trip = await findTripById(null, tripId)
+    if (!trip) return next(createError(404, "Trip not found"))
+    if (trip.driverId !== req.user.id) return next(createError(403, "Not your trip"))
+
+    const updated = await withTransaction(async (connection) => {
+      const deliveryRows = await exec(
+        connection,
+        `SELECT id, requester_id, status, assigned_driver_id
+         FROM Deliveries
+         WHERE id = ? AND trip_id = ?
+         FOR UPDATE`,
+        [deliveryId, tripId],
+      )
+
+      if (!deliveryRows.length) {
+        throw createError(404, "Join request not found or not linked to this trip")
+      }
+
+      const delivery = deliveryRows[0]
+      if (delivery.status !== "Pending") {
+        throw createError(400, "Delivery is not in pending status")
+      }
+      if (delivery.assigned_driver_id) {
+        throw createError(400, "Delivery already has an assigned driver")
+      }
+
+      const tripRows = await exec(
+        connection,
+        `SELECT status, available_capacity
+         FROM Trips
+         WHERE id = ?
+         FOR UPDATE`,
+        [tripId],
+      )
+      if (!tripRows.length) throw createError(404, "Trip not found")
+      if (tripRows[0].status !== "planned" && tripRows[0].status !== "active") {
+        throw createError(400, "Trip is not active")
+      }
+      if ((tripRows[0].available_capacity || 0) <= 0) {
+        throw createError(400, "Trip has no available capacity")
+      }
+
+      await exec(
+        connection,
+        `UPDATE Deliveries
+         SET assigned_driver_id = ?, status = 'Accepted', updated_at = NOW()
+         WHERE id = ?`,
+        [req.user.id, deliveryId],
+      )
+
+      await touchTimeline(connection, deliveryId, "accepted_at")
+
+      await exec(
+        connection,
+        `UPDATE Trips SET available_capacity = GREATEST(available_capacity - 1, 0) WHERE id = ?`,
+        [tripId],
+      )
+
+      return findDeliveryById(connection, deliveryId, {
+        includeDriver: true,
+        includeRequester: true,
+        includeTrip: true,
+      })
+    })
+
+    createNotification({
+      recipient: updated.senderId,
+      title: "Demande d'adhésion acceptée",
+      message: `Votre demande d\'adhésion au trajet a été acceptée par le conducteur.`,
+      type: "join_request_accepted",
+      reference: tripId,
+      referenceModel: "Trip",
+      deliveryId: updated.id,
+      tripId,
+      sendEmail: false,
+    }).catch(() => {})
+
+    return sendSuccess(res, 200, "Join request accepted successfully", { delivery: updated })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export const rejectJoinRequest = async (req, res, next) => {
+  try {
+    const { tripId, deliveryId } = req.params
+
+    const trip = await findTripById(null, tripId)
+    if (!trip) return next(createError(404, "Trip not found"))
+    if (trip.driverId !== req.user.id) return next(createError(403, "Not your trip"))
+
+    let requesterId = null
+
+    await withTransaction(async (connection) => {
+      const rows = await exec(
+        connection,
+        `SELECT id, requester_id, status, assigned_driver_id
+         FROM Deliveries
+         WHERE id = ? AND trip_id = ?
+         FOR UPDATE`,
+        [deliveryId, tripId],
+      )
+
+      if (!rows.length) {
+        throw createError(404, "Join request not found or not linked to this trip")
+      }
+
+      const delivery = rows[0]
+      if (delivery.assigned_driver_id) {
+        throw createError(400, "Delivery already has an assigned driver")
+      }
+
+      requesterId = delivery.requester_id
+
+      await exec(
+        connection,
+        `UPDATE Deliveries SET trip_id = NULL, updated_at = NOW() WHERE id = ?`,
+        [deliveryId],
+      )
+
+      await exec(
+        connection,
+        `INSERT INTO DeliveryRejections (id, delivery_id, driver_id, reason, created_at)
+         VALUES (?, ?, ?, ?, NOW())`,
+        [crypto.randomUUID(), deliveryId, req.user.id, req.body.reason || "Conducteur a refusé la demande"],
+      )
+    })
+
+    if (requesterId) {
+      createNotification({
+        recipient: requesterId,
+        title: "Demande d'adhésion refusée",
+        message: "Votre demande d'adhésion au trajet a été refusée par le conducteur.",
+        type: "join_request_rejected",
+        reference: tripId,
+        referenceModel: "Trip",
+        deliveryId,
+        tripId,
+        sendEmail: false,
+      }).catch(() => {})
+    }
+
+    return sendSuccess(res, 200, "Join request rejected successfully")
   } catch (error) {
     next(error)
   }
