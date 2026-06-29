@@ -75,7 +75,7 @@ export const getMyRating = async (req, res, next) => {
   try {
     const driver = await findDriverByUserId(null, req.user.id)
     if (!driver) return next(createError(404, "Driver profile not found"))
-    const data = await getDriverRatingAggregate(null, driver.participantId)
+    const data = await getDriverRatingAggregate(null, driver.driverId)
     return sendSuccess(res, 200, "Rating fetched successfully", data)
   } catch (error) {
     next(error)
