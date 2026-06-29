@@ -1254,7 +1254,9 @@ export const listDriverAvailableDeliveries = async (req, res, next) => {
       })
     }
 
-    deliveries.sort((a, b) => a.match.score - b.match.score)
+    if (!filters.sort_by) {
+      deliveries.sort((a, b) => a.match.score - b.match.score)
+    }
 
     const response = {
       deliveries,
