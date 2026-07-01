@@ -44,6 +44,7 @@ import {
   buildDriverExecutionPayload,
   buildDeliveryCompatibility,
   buildDeliveryMatch,
+  calculateDriverDeliveryCompatibility,
   listDriverTripsForCompatibility,
   findCompatibleDriversForDelivery,
   getEstimateById,
@@ -59,6 +60,7 @@ import {
   distancePointToSegmentMeters,
   savePricingAnalytics,
 } from "../services/delivery.service.js"
+import { getRecommendedDeliveries, getMatchingDashboardStats } from "../services/matching.service.js"
 import { distanceMeters as haversineDistance } from "../utils/maps.js"
 import { emitToUser, getIO } from "../socket/index.js"
 
@@ -126,6 +128,12 @@ const MAX_LEN = {
 }
 
 const sanitizeHtml = (s) => (typeof s === "string" ? s.replace(/<[^>]*>/g, "") : s)
+
+const extractWilaya = (address) => {
+  if (!address) return null
+  const parts = address.split(',').map((p) => p.trim()).filter(Boolean)
+  return parts.length >= 2 ? parts[parts.length - 2] : parts[0] || null
+}
 
 const sanitizeDeliveryInput = (body) => {
   if (!body || typeof body !== "object") return body
@@ -268,6 +276,11 @@ export const createDelivery = async (req, res, next) => {
       const assignedTripId = winningDriver?.bestTrip?.tripId || attachedTripId
       const assignedDriverId = winningDriver?.driverId || null
 
+      const pickupAddress = req.body.pickup?.address || ''
+      const dropoffAddress = req.body.dropoff?.address || ''
+      const pickupWilaya = extractWilaya(pickupAddress)
+      const dropoffWilaya = extractWilaya(dropoffAddress)
+
       const delivery = await createDeliveryRecord(connection, {
         id: deliveryId,
         requesterId: req.user.id,
@@ -275,6 +288,8 @@ export const createDelivery = async (req, res, next) => {
         assignedDriverId,
         pickup: req.body.pickup,
         dropoff: req.body.dropoff,
+        pickupWilaya,
+        dropoffWilaya,
         recipient: req.body.recipient,
         packageInfo: req.body.package,
         packageImageUrl: req.body.packageImageUrl || "",
@@ -471,11 +486,21 @@ export const listUserDeliveries = async (req, res, next) => {
       statusGroup: statusGroup || null,
     })
 
+    // Always compute counts for all status groups (for tab badges)
+    const [pendingCount, inProgressCount, deliveredCount, cancelledCount] = await Promise.all([
+      countUserDeliveries(null, req.user.id, { statusGroup: "pending" }),
+      countUserDeliveries(null, req.user.id, { statusGroup: "inProgress" }),
+      countUserDeliveries(null, req.user.id, { statusGroup: "delivered" }),
+      countUserDeliveries(null, req.user.id, { statusGroup: "cancelled" }),
+    ])
+
     const deliveriesWithLabels = deliveries.map((delivery) => ({
       ...delivery,
       statusLabel: STATUS_DISPLAY_LABELS[delivery.status] || delivery.status,
       statusGroupLabel: STATUS_GROUP_DISPLAY_LABELS[delivery.statusGroup] || delivery.statusGroup,
     }))
+
+    const overallTotal = pendingCount + inProgressCount + deliveredCount + cancelledCount
 
     return sendSuccess(res, 200, "User deliveries fetched successfully", {
       deliveries: deliveriesWithLabels,
@@ -484,6 +509,13 @@ export const listUserDeliveries = async (req, res, next) => {
         page,
         pages: Math.ceil(total / limit),
         limit,
+      },
+      groupCounts: {
+        all: overallTotal,
+        pending: pendingCount,
+        inProgress: inProgressCount,
+        delivered: deliveredCount,
+        cancelled: cancelledCount,
       },
     })
   } catch (error) {
@@ -1181,13 +1213,12 @@ export const listDriverAvailableDeliveries = async (req, res, next) => {
       params.push(Number(filters.max_weight_kg))
     }
     if (filters.wilaya_pickup) {
-      clauses.push("pl.address LIKE ?")
-      params.push(`%${filters.wilaya_pickup}%`)
+      clauses.push("d.pickup_wilaya = ?")
+      params.push(filters.wilaya_pickup)
     }
     if (filters.wilaya_dropoff) {
-      clauses.push("dl.address LIKE ?")
-      params.push(`%${filters.wilaya_dropoff}%`)
-      joins.push("LEFT JOIN DeliveryLocations dl ON dl.delivery_id = d.id AND dl.type = 'DROPOFF'")
+      clauses.push("d.dropoff_wilaya = ?")
+      params.push(filters.wilaya_dropoff)
     }
 
     const where = clauses.join(" AND ")
@@ -2149,6 +2180,17 @@ export const markDeliveryCompleted = async (req, res, next) => {
       },
     )
 
+    // Notify driver to rate the client
+    createNotification({
+      recipientId: req.user.id,
+      title: "\u00C9valuez votre client \u2B50",
+      message: "Votre livraison est termin\u00E9e. Merci de partager votre exp\u00E9rience avec le client.",
+      type: "rate_client",
+      deliveryId: updated.id,
+      reference: updated.id,
+      referenceModel: "Delivery",
+    }).catch(() => {})
+
     // Auto-complete trip if all deliveries are done
     if (updated?.tripId) {
       checkAndCompleteTrip(null, updated.tripId).catch(() => {})
@@ -2429,92 +2471,279 @@ export const updatePaymentStatus = async (req, res, next) => {
   }
 }
 
+// ── Helpers for wilaya backfill and matching ──
+
+const fallbackPickupWilaya = async (deliveryId) => {
+  try {
+    const locRows = await exec(
+      null,
+      `SELECT address FROM DeliveryLocations WHERE delivery_id = ? AND type = 'PICKUP' LIMIT 1`,
+      [deliveryId],
+    )
+    const address = locRows[0]?.address || ''
+    return extractWilaya(address) || address.split(',').map((p) => p.trim()).filter(Boolean)[0] || ''
+  } catch (_) {
+    return ''
+  }
+}
+
+const fallbackDropoffWilaya = async (deliveryId) => {
+  try {
+    const locRows = await exec(
+      null,
+      `SELECT address FROM DeliveryLocations WHERE delivery_id = ? AND type = 'DROPOFF' LIMIT 1`,
+      [deliveryId],
+    )
+    const address = locRows[0]?.address || ''
+    return extractWilaya(address) || address.split(',').map((p) => p.trim()).filter(Boolean)[0] || ''
+  } catch (_) {
+    return ''
+  }
+}
+
 export const listDriverAvailablePackagesByWilaya = async (req, res, next) => {
   try {
-    const userRows = await exec(null, `SELECT city FROM Users WHERE id = ?`, [req.user.id])
-    const driverCity = userRows[0]?.city
-    if (!driverCity) {
-      return sendSuccess(res, 200, "Available packages fetched successfully", { deliveries: [], total: 0 })
+    // ═══════════════════════════════════════════════════════════════
+    // ÉTAPE 1-2: Identifier route, controller, requête SQL
+    // Route:   GET /api/deliveries/driver/available-by-wilaya
+    // Fichier: backend/routes/delivery.routes.js:90
+    // Controller: backend/controllers/delivery.workflow.js
+    //   → listDriverAvailablePackagesByWilaya (ligne 2462)
+    // Modèle:  backend/models/delivery.model.js → findDeliveryById
+    // ═══════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════
+    // ÉTAPE 3: Récupération zone du Driver
+    // ═══════════════════════════════════════════════════════════════
+    const driver = await findDriverByUserId(null, req.user.id)
+    if (!driver) {
+      return next(createError(404, "Driver profile not found"))
     }
+
+    const userRows = await exec(null, `SELECT city FROM Users WHERE id = ?`, [req.user.id])
+    const driverCityRaw = (userRows[0]?.city || '').trim()
+    const driverCity = driverCityRaw
 
     const driverLocation = await getDriverLocation(null, req.user.id)
-    const hasLocation = driverLocation && driverLocation.latitude != null && driverLocation.longitude != null
-    const driverLat = hasLocation ? Number(driverLocation.latitude) : null
-    const driverLng = hasLocation ? Number(driverLocation.longitude) : null
+    const hasCoordinates = driverLocation && driverLocation.latitude != null && driverLocation.longitude != null
+    const driverCoordinates = hasCoordinates ? [Number(driverLocation.longitude), Number(driverLocation.latitude)] : null
 
-    const rows = await exec(
-      null,
-      `SELECT d.id,
-              ANY_VALUE(pl.latitude) AS pickup_lat,
-              ANY_VALUE(pl.longitude) AS pickup_lng,
-              ANY_VALUE(dp.price) AS price,
-              ANY_VALUE(d.created_at) AS created_at,
-              ANY_VALUE(d.package_weight_kg) AS weight
-       FROM Deliveries d
-       LEFT JOIN DeliveryRejections r ON r.delivery_id = d.id AND r.driver_id = ?
-       LEFT JOIN DeliveryPricing dp ON dp.delivery_id = d.id
-       LEFT JOIN DeliveryLocations pl ON pl.delivery_id = d.id AND pl.type = 'PICKUP'
-       WHERE d.status = 'Pending'
-         AND d.assigned_driver_id IS NULL
-         AND r.id IS NULL
-         AND (d.trip_id IS NULL OR d.trip_id IN (
-           SELECT t.id FROM Trips t WHERE t.driver_id = ? AND t.status IN ('planned','active')
-         ))
-         AND pl.address LIKE ?
-       GROUP BY d.id
-       ORDER BY d.created_at DESC
-       LIMIT 500`,
-      [req.user.id, req.user.id, `%${driverCity}%`],
-    )
+    console.log('')
+    console.log('╔══════════════════════════════════════════════════════╗')
+    console.log('║  [available-by-wilaya]   DEBUG SESSION              ║')
+    console.log('╚══════════════════════════════════════════════════════╝')
+    console.log(`Driver ID:       ${req.user.id}`)
+    console.log(`Driver Wilaya:   "${driverCity}"`)
+    console.log(`Driver GPS:      ${hasCoordinates ? `[${driverCoordinates}]` : 'NON DISPONIBLE'}`)
+    console.log(`Driver Type:     ${driver.driverType}`)
+    console.log(`Driver Vehicle:  ${driver.vehicleType || 'city_car (default)'}`)
+    console.log(`Driver Max Kg:   ${driver.maxWeightKg}`)
 
-    const candidates = []
-    for (const row of rows) {
-      let distanceKm = null
-      if (hasLocation && row.pickup_lat != null) {
-        const dist = distanceMeters(
-          [Number(row.pickup_lng), Number(row.pickup_lat)],
-          [driverLng, driverLat],
-        )
-        if (dist != null) distanceKm = Math.round((dist / 1000) * 100) / 100
-      }
-      candidates.push({
-        id: row.id,
-        distanceKm,
-        price: Number(row.price || 0),
-        createdAt: row.created_at,
-      })
+    const driverType = driver.driverType || 'normal_driver'
+    const driverMaxWeightKg = driver.maxWeightKg != null ? Number(driver.maxWeightKg) : null
+    const driverTrips = await listDriverTripsForCompatibility(null, req.user.id)
+    const driverVehicleType = driver.vehicleType || 'city_car'
+
+    // ═══════════════════════════════════════════════════════════════
+    // Requête SQL: récupérer les livraisons Pending non assignées
+    // ═══════════════════════════════════════════════════════════════
+    const baseParams = [req.user.id, req.user.id]
+    const joins = [
+      'LEFT JOIN DeliveryRejections r ON r.delivery_id = d.id AND r.driver_id = ?',
+      'LEFT JOIN DeliveryPricing dp ON dp.delivery_id = d.id',
+      'LEFT JOIN DeliveryLocations pl ON pl.delivery_id = d.id AND pl.type = \'PICKUP\'',
+    ]
+    const clauses = [
+      "d.status = 'Pending'",
+      'd.assigned_driver_id IS NULL',
+      'r.id IS NULL',
+      "(d.trip_id IS NULL OR d.trip_id IN (SELECT t.id FROM Trips t WHERE t.driver_id = ? AND t.status IN ('planned','active')))",
+    ]
+
+    // Wilaya filter: si le driver a une wilaya, filtrer par pickup_wilaya
+    // SINON, prendre toutes les livraisons Pending (pas de restriction)
+    if (driverCity) {
+      clauses.push('d.pickup_wilaya = ?')
+      baseParams.push(driverCity)
+      console.log(`Wilaya filter:   d.pickup_wilaya = "${driverCity}"`)
+    } else {
+      console.log(`Wilaya filter:   AUCUN — driver sans wilaya, pas de filtre`)
     }
 
-    candidates.sort((a, b) => {
-      const distA = a.distanceKm ?? Infinity
-      const distB = b.distanceKm ?? Infinity
-      if (distA !== distB) return distA - distB
-      const dateA = a.createdAt ? new Date(a.createdAt).getTime() : 0
-      const dateB = b.createdAt ? new Date(b.createdAt).getTime() : 0
-      if (dateA !== dateB) return dateB - dateA
-      return b.price - a.price
-    })
+    const sqlQuery = `SELECT d.id,
+        ANY_VALUE(pl.latitude) AS pickup_lat,
+        ANY_VALUE(pl.longitude) AS pickup_lng,
+        ANY_VALUE(pl.address) AS pickup_address,
+        ANY_VALUE(dp.price) AS price,
+        ANY_VALUE(d.created_at) AS created_at,
+        ANY_VALUE(d.package_weight_kg) AS weight
+ FROM Deliveries d
+ ${joins.join(' ')}
+ WHERE ${clauses.join(' AND ')}
+ GROUP BY d.id
+ ORDER BY d.created_at DESC
+ LIMIT 500`
 
-    const deliveries = []
-    for (const c of candidates) {
-      const delivery = await findDeliveryById(null, c.id, {
+    console.log(`\n--- SQL QUERY ---\n${sqlQuery}`)
+    console.log(`SQL Params:      ${JSON.stringify(baseParams)}`)
+
+    const rows = await exec(null, sqlQuery, baseParams)
+
+    console.log(`\nSQL RESULT:      ${rows.length} ligne(s) retournée(s)`)
+
+    // ═══════════════════════════════════════════════════════════════
+    // ÉTAPE 4: Analyser chaque livraison
+    // ═══════════════════════════════════════════════════════════════
+    const scoredDeliveries = []
+    for (const row of rows) {
+      const delivery = await findDeliveryById(null, row.id, {
         includeDriver: false,
         includeRequester: false,
         includeTrip: false,
       })
-      if (delivery) {
-        deliveries.push({
-          ...delivery,
-          distanceKm: c.distanceKm,
-        })
+      if (!delivery) {
+        console.log(`  Delivery ${row.id}: findDeliveryById returned null — SKIP`)
+        continue
+      }
+
+      // ══════════════════════════════════════════════════════════
+      // Récupérer pickup_wilaya: d'abord depuis le modèle,
+      // sinon fallback depuis DeliveryLocations
+      // ══════════════════════════════════════════════════════════
+      let pickupWilaya = delivery?.pickupWilaya || null
+      let dropoffWilaya = delivery?.dropoffWilaya || null
+
+      if (!pickupWilaya) {
+        pickupWilaya = await fallbackPickupWilaya(delivery.id)
+        delivery.pickupWilaya = pickupWilaya
+        console.log(`  Delivery ${delivery.id}: pickupWilaya NULL, fallback → "${pickupWilaya}"`)
+      }
+      if (!dropoffWilaya) {
+        dropoffWilaya = await fallbackDropoffWilaya(delivery.id)
+        delivery.dropoffWilaya = dropoffWilaya
+      }
+
+      console.log(`\n  ─── Delivery ${delivery.id} ───`)
+      console.log(`  Pickup Wilaya:  "${pickupWilaya}"`)
+      console.log(`  Dropoff Wilaya: "${dropoffWilaya}"`)
+      console.log(`  Status:         ${delivery.status}`)
+      console.log(`  Package:        ${delivery?.package?.sizeCategory || 'N/A'} / ${delivery?.package?.weightKg || '?'} kg`)
+
+      // Vérifier compatibilité wilaya avant le calcul complet
+      const cityMatch = driverCity && pickupWilaya
+        ? pickupWilaya.toLowerCase() === driverCity.toLowerCase()
+        : false
+      if (!cityMatch) {
+        console.log(`  Compatible:     NO — Wilaya différente`)
+        console.log(`    Raison:       pickup="${pickupWilaya}" ≠ driverCity="${driverCity}"`)
+        // Ne pas exclure — laisser calculateDriverDeliveryCompatibility décider
+      }
+
+      const compatibility = calculateDriverDeliveryCompatibility({
+        delivery,
+        driverCity,
+        driverType,
+        driverMaxWeightKg,
+        driverVehicleType,
+        driverTrips,
+        driverCoordinates,
+      })
+
+      console.log(`  Compatible:     ${compatibility.compatible ? 'YES' : 'NO'}`)
+      console.log(`  Score:          ${compatibility.score}/100`)
+      console.log(`  Raisons:        ${compatibility.reasons.join(', ') || 'aucune'}`)
+
+      scoredDeliveries.push({
+        ...delivery,
+        compatibilityScore: compatibility.score,
+        compatibilityReasons: compatibility.reasons,
+        compatible: compatibility.compatible,
+      })
+    }
+
+    // Afficher le résumé
+    const totalCompatible = scoredDeliveries.filter((d) => d.compatible).length
+    console.log(`\n═══ RÉSUMÉ ═══`)
+    console.log(`Total lignes SQL:    ${rows.length}`)
+    console.log(`Total compatibles:   ${totalCompatible}`)
+    console.log(`Total rejetés:       ${scoredDeliveries.length - totalCompatible}`)
+
+    // Afficher les livraisons rejetées avec raison
+    for (const d of scoredDeliveries) {
+      if (!d.compatible) {
+        const reason = d.compatibilityReasons?.join(', ') || 'inconnue'
+        console.log(`  ✗ ${d.id}: ${reason}`)
       }
     }
 
-    return sendSuccess(res, 200, "Available packages fetched successfully", {
+    // ═══════════════════════════════════════════════════════════════
+    // ÉTAPE 5: Retourner uniquement les livraisons compatibles
+    // ═══════════════════════════════════════════════════════════════
+    const compatibleOnly = scoredDeliveries
+      .filter((d) => d.compatible)
+      .sort((a, b) => b.compatibilityScore - a.compatibilityScore || new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime())
+
+    const result = compatibleOnly.map(({ compatible, ...rest }) => rest)
+
+    if (result.length === 0) {
+      // Déterminer la raison du vide
+      let emptyReason = 'Aucune livraison Pending trouvée dans votre zone.'
+      if (rows.length === 0) {
+        emptyReason = driverCity
+          ? `Aucune livraison Pending trouvée dans la wilaya "${driverCity}". Vérifiez que des livraisons existent avec pickup_wilaya = "${driverCity}".`
+          : `Aucune livraison Pending trouvée. Complétez votre profil (wilaya) pour filtrer par zone.`
+      } else if (totalCompatible === 0) {
+        emptyReason = `Des livraisons existent (${scoredDeliveries.length}) mais aucune n'est compatible avec votre profil (véhicule, poids, taille).`
+      }
+      console.log(`\n⚠ RÉSULTAT VIDE: ${emptyReason}`)
+      return sendSuccess(res, 200, emptyReason, {
+        deliveries: [],
+        total: 0,
+        debug: {
+          driverCity,
+          driverVehicleType,
+          driverType,
+          totalPending: rows.length,
+          totalAfterCompatibility: totalCompatible,
+          emptyReason,
+        },
+      })
+    }
+
+    return sendSuccess(res, 200, "Compatible packages fetched successfully", {
+      deliveries: result,
+      total: result.length,
+    })
+  } catch (error) {
+    console.error(`[available-by-wilaya] ERREUR:`, error)
+    next(error)
+  }
+}
+
+// ── NEW: Intelligent recommended deliveries with matching engine ──
+
+const VALID_SIZES = new Set(['small', 'medium', 'large', 'xlarge'])
+const VALID_WEIGHTS = new Set(['0-5', '5-20', '20-100', '100+'])
+const VALID_DAYS = new Set(['today', 'tomorrow'])
+
+export const listDriverRecommendedDeliveries = async (req, res, next) => {
+  try {
+    const filters = {}
+    const day = req.query.day?.toLowerCase()
+    if (day && VALID_DAYS.has(day)) filters.day = day
+    const size = req.query.size?.toLowerCase()
+    if (size && VALID_SIZES.has(size)) filters.size = size
+    const weight = req.query.weight?.toLowerCase()
+    if (weight && VALID_WEIGHTS.has(weight)) filters.weight = weight
+
+    const { deliveries } = await getRecommendedDeliveries(req.user.id, filters)
+
+    return sendSuccess(res, 200, 'Deliveries scored successfully', {
       deliveries,
       total: deliveries.length,
     })
   } catch (error) {
+    console.error('[recommended-deliveries] ERROR:', error)
     next(error)
   }
 }

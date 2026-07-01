@@ -82,6 +82,10 @@ export const findDriverByUserId = async (connection, userId) => {
             availability,
             rating,
             vehicle_info AS vehicleInfo,
+            vehicle_type AS vehicleType,
+            max_weight_kg AS maxWeightKg,
+            max_volume_m3 AS maxVolumeM3,
+            max_size_category AS maxSizeCategory,
             filter_preferences AS filterPreferences,
             notification_preferences AS notificationPreferences,
             approval_welcome_shown AS approvalWelcomeShown
@@ -92,6 +96,16 @@ export const findDriverByUserId = async (connection, userId) => {
   )
 
   return rows[0] || null
+}
+
+export const updateDriverVehicleType = async (connection, { driverId, vehicleType, maxWeightKg, maxVolumeM3, maxSizeCategory }) => {
+  await exec(
+    connection,
+    `UPDATE Drivers
+     SET vehicle_type = ?, max_weight_kg = ?, max_volume_m3 = ?, max_size_category = ?
+     WHERE participant_id = ?`,
+    [vehicleType, maxWeightKg, maxVolumeM3, maxSizeCategory, driverId],
+  )
 }
 
 // Documents (uses existing Documents table)

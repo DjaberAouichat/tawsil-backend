@@ -2,6 +2,7 @@ import { exec } from "../lib/db.js"
 import { findDriverByUserId, updateDriverAvailability } from "../models/driver.model.js"
 import { findDeliveryById } from "../models/delivery.model.js"
 import { sendSuccess, createError } from "../utils/response.js"
+import { getMatchingDashboardStats } from "../services/matching.service.js"
 import { fetchClientHomeData } from "./client.controller.js"
 
 const ACTIVE_DELIVERY_STATUSES = ["Accepted", "DriverArrivedPickup", "PickedUp", "InTransit", "ArrivedDropoff"]
@@ -131,6 +132,25 @@ export const getDriverDashboardSummary = async (req, res, next) => {
         })
       : null
 
+    const onTimeRows = await exec(
+      null,
+      `SELECT COUNT(*) AS onTime FROM DeliveryRatings WHERE driver_id = ? AND delivery_time_rating >= 4`,
+      [req.user.id],
+    )
+
+    const memberRows = await exec(
+      null,
+      `SELECT created_at FROM Users WHERE id = ?`,
+      [req.user.id],
+    )
+
+    const total = Number(deliveryCounts[0]?.totalDeliveries || 0)
+    const completed = Number(deliveryCounts[0]?.completedDeliveries || 0)
+    const cancelled = Number(deliveryCounts[0]?.cancelledDeliveries || 0)
+    const successRate = total > 0 ? (completed / total) : 0
+
+    const matchingStats = await getMatchingDashboardStats(req.user.id)
+
     return sendSuccess(res, 200, "Driver dashboard summary fetched successfully", {
       driver: {
         driverId: driver.driverId,
@@ -154,6 +174,9 @@ export const getDriverDashboardSummary = async (req, res, next) => {
         currency: "DZD",
         averageRating: Number(ratingRows[0]?.averageRating || 0),
         ratingCount: Number(ratingRows[0]?.ratingCount || 0),
+        successRate,
+        onTimeDeliveries: Number(onTimeRows?.onTime || 0),
+        memberSince: memberRows[0]?.created_at || null,
       },
       shortcuts: {
         canCreateTrip: !!driver.isDocumentsVerified,
@@ -168,6 +191,12 @@ export const getDriverDashboardSummary = async (req, res, next) => {
         reviewStatus: driver.reviewStatus || (driver.isDocumentsVerified ? "approved" : "pending"),
         isDocumentsVerified: !!driver.isDocumentsVerified,
         needsResubmission: driver.reviewStatus === "rejected",
+      },
+      matchingStats: {
+        recommendedCount: matchingStats.recommendedCount,
+        potentialRevenue: matchingStats.potentialRevenue,
+        averageCompatibility: matchingStats.averageCompatibility,
+        averageDistance: matchingStats.averageDistance,
       },
     })
   } catch (error) {

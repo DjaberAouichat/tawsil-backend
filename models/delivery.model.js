@@ -232,6 +232,8 @@ export const createDelivery = async (
     assignedDriverId = null,
     pickup,
     dropoff,
+    pickupWilaya = null,
+    dropoffWilaya = null,
     recipient,
     packageInfo,
     packageImageUrl = "",
@@ -251,8 +253,9 @@ export const createDelivery = async (
         package_weight_category, package_size_category, package_weight_kg,
         package_length_cm, package_width_cm, package_height_cm, package_volume_m3,
         capacity_reserved, is_urgent, delivery_mode,
+        pickup_wilaya, dropoff_wilaya,
         recipient_name, recipient_phone, delivery_note, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
   const insertResult = await exec(
     connection,
     sql,
@@ -274,6 +277,8 @@ export const createDelivery = async (
       0,
       isUrgent ? 1 : 0,
       deliveryMode,
+      pickupWilaya,
+      dropoffWilaya,
       recipient?.name || null,
       recipient?.phone || null,
       deliveryNote || null,
@@ -368,7 +373,9 @@ export const findDeliveryById = async (
             package_type, package_description, package_image_url,
             package_weight_category, package_size_category, package_weight_kg,
             package_length_cm, package_width_cm, package_height_cm, package_volume_m3,
-            capacity_reserved, is_urgent, delivery_mode, recipient_name, recipient_phone,
+            capacity_reserved, is_urgent, delivery_mode,
+            pickup_wilaya, dropoff_wilaya,
+            recipient_name, recipient_phone,
             delivery_note, status, created_at, updated_at
      FROM Deliveries
      WHERE id = ?
@@ -546,6 +553,8 @@ export const findDeliveryById = async (
     status: row.status,
     statusGroup: STATUS_TO_GROUP[row.status] || "active",
     availableActions: buildAvailableActions(row),
+    pickupWilaya: row.pickup_wilaya || null,
+    dropoffWilaya: row.dropoff_wilaya || null,
     deliveryMode: row.delivery_mode || "standard",
     isUrgent: !!row.is_urgent,
     createdAt: row.created_at,

@@ -95,6 +95,12 @@ export const sendNewDeliveryNearbyNotifications = async (delivery) => {
         price,
         distanceKm: Math.round(distanceKm * 100) / 100,
       })
+
+      // Also emit a dedicated event for the real-time list update
+      emitToUser(driver.driverId, "notification:compatible_delivery", {
+        deliveryId: delivery.id,
+        timestamp: new Date().toISOString(),
+      })
     }
   } catch (error) {
     console.error("sendNewDeliveryNearbyNotifications error:", error)

@@ -295,6 +295,7 @@ const AUTHORITY_ACCOUNTS = [
   { email: 'Police@tawsil.dz', firstName: 'Police', lastName: 'Tawsil', phone: '+213770000001' },
   { email: 'Gendarmerie@tawsil.dz', firstName: 'Gendarmerie', lastName: 'Tawsil', phone: '+213770000002' },
   { email: 'DirectorateOfTransportation@tawsil.dz', firstName: 'Direction', lastName: 'Transport', phone: '+213770000003' },
+  { email: 'authoritie@tawsil.dz', firstName: 'Authority', lastName: 'Tawsil', phone: '+213770000004' },
 ];
 const AUTHORITY_PASSWORD_PLAIN = process.env.DEFAULT_AUTHORITY_PASSWORD || (process.env.NODE_ENV !== 'production' ? 'tawsilgo' : null);
 
@@ -316,18 +317,17 @@ const ensureAuthorityAccounts = async () => {
       );
       let userId = existing.length > 0 ? existing[0].id : null;
 
-      const [authCheck] = await pool.execute(
-        'SELECT user_id FROM Authorities WHERE user_id = ? LIMIT 1',
-        [userId],
-      );
-      if (userId && authCheck.length > 0) {
+      if (userId) {
+        await pool.execute(
+          `UPDATE Users SET password = ?, first_name = ?, last_name = ?, 
+           is_email_verified = 1, is_onboarded = 1, updated_at = NOW()
+           WHERE id = ?`,
+          [passwordHash, acct.firstName, acct.lastName, userId],
+        );
         if (process.env.NODE_ENV !== 'production') {
-          console.log(`Compte authority trouve: ${acct.email}`);
+          console.log(`Compte authority mis a jour: ${acct.email}`);
         }
-        continue;
-      }
-
-      if (!userId) {
+      } else {
         userId = randomUUID();
         await pool.execute(
           `INSERT INTO Users (id, first_name, last_name, email, password, phone, is_email_verified, is_onboarded, created_at, updated_at)
@@ -341,7 +341,7 @@ const ensureAuthorityAccounts = async () => {
 
       await pool.execute('INSERT IGNORE INTO Authorities (user_id) VALUES (?)', [userId]);
       if (process.env.NODE_ENV !== 'production') {
-        console.log(`Compte authority cree avec succes: ${acct.email}`);
+        console.log(`Compte authority assure: ${acct.email}`);
       }
     }
   } catch (error) {

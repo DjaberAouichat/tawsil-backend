@@ -7,6 +7,7 @@ import { calculateCrossShippingPrice, calculateProfessionalDeliveryPrice, select
 import { determineDeliveryMode } from "./matching.service.js"
 import { getDriverLocation } from "../models/driver.model.js"
 import { listDriverTrips as listDriverTripsModel } from "../models/trip.model.js"
+import { getVehicleCategory, PERSONAL_VEHICLE_IDS, PROFESSIONAL_VEHICLE_IDS, getVehiclesForDriverType } from "../vehicle_capacities.js"
 
 
 
@@ -396,6 +397,143 @@ export const buildDeliveryMatch = ({ delivery, driverTrips = [], driverLocation 
     route: bestTripMatch ? { tripId: bestTripMatch.tripId, pickupToRouteMeters: Math.round(bestTripMatch.pickupToRouteMeters), dropoffToRouteMeters: Math.round(bestTripMatch.dropoffToRouteMeters), estimatedDetourMeters: Math.round(bestTripMatch.detourMeters) } : null,
     thresholds: { maxPickupDistanceMeters: DRIVER_MATCH_MAX_PICKUP_DISTANCE_METERS, maxRouteCorridorMeters: DRIVER_MATCH_MAX_ROUTE_CORRIDOR_METERS, maxTripDetourMeters: DRIVER_MATCH_MAX_TRIP_DETOUR_METERS },
   }
+}
+
+const SIZE_LABELS = { small: 'Petit', medium: 'Moyen', large: 'Grand', xlarge: 'Très grand' }
+const PACKAGE_VOLUME_LABEL = { small: 'Petit', medium: 'Moyen', large: 'Grand', xlarge: 'Très grand' }
+
+/**
+ * Calculate a delivery compatibility score (0-100) for a given driver and delivery.
+ * Returns { score, reasons, compatible } where:
+ *   - score: 0-100 integer
+ *   - reasons: human-readable list of matching criteria
+ *   - compatible: boolean — false if any mandatory criterion fails
+ */
+export const calculateDriverDeliveryCompatibility = ({
+  delivery,
+  driverCity,
+  driverType,
+  driverMaxWeightKg,
+  driverVehicleType,
+  driverTrips = [],
+  driverCoordinates = null,
+}) => {
+  const reasons = []
+  let score = 0
+
+  // 1. Wilaya — mandatory (40%)
+  const pickupRaw = delivery?.pickupWilaya || delivery?.pickup?.address || ''
+  const pickupLower = pickupRaw.toLowerCase()
+  const cityLower = (driverCity || '').toLowerCase()
+  const sameWilaya = cityLower && (
+    pickupLower === cityLower ||
+    pickupLower.includes(cityLower) ||
+    pickupLower.split(',').map(p => p.trim()).includes(cityLower)
+  )
+  if (!sameWilaya) {
+    return { score: 0, reasons: ['Wilaya différente — livraison non compatible'], compatible: false }
+  }
+  score += 40
+  reasons.push('Même wilaya')
+
+  // 2. Vehicle / Driver type compatibility (10%)
+  const sizeCategory = String(delivery?.package?.sizeCategory || '').toLowerCase()
+  const packageSizeLevel = PACKAGE_SIZE_LEVEL[sizeCategory] || null
+
+  const vehicle = getVehicleCategory(driverVehicleType)
+  const vehicleLimits = vehicle || { maxSizeLevel: 2, maxWeightKg: 80 }
+
+  const maxAllowedSize = vehicleLimits.maxSizeLevel
+  const packageWeight = delivery?.package?.weightKg !== null && delivery?.package?.weightKg !== undefined
+    ? Number(delivery.package.weightKg)
+    : null
+  const driverWeightCapacity = driverMaxWeightKg != null ? Number(driverMaxWeightKg) : vehicleLimits.maxWeightKg
+
+  if (packageSizeLevel && packageSizeLevel > maxAllowedSize) {
+    return { score: 0, reasons: ['Taille trop grande pour votre véhicule'], compatible: false }
+  }
+  if (packageWeight != null && packageWeight > driverWeightCapacity) {
+    return { score: 0, reasons: ['Poids trop élevé pour votre capacité'], compatible: false }
+  }
+  if (packageSizeLevel) score += 10
+  reasons.push('Taille compatible')
+
+  // 3. Weight compatibility (15%)
+  if (packageWeight != null && packageWeight <= driverWeightCapacity) {
+    score += 15
+    reasons.push('Poids compatible')
+  } else if (packageWeight != null) {
+    return { score: 0, reasons: ['Poids trop élevé'], compatible: false }
+  }
+
+  // 4. Route / itinerary compatibility (20%)
+  const activeTrips = (driverTrips || []).filter((t) => ['planned', 'active'].includes(t.status))
+  let routeScore = 0
+  let routeReason = null
+
+  if (activeTrips.length > 0) {
+    const pickupCoords = toCoordinatePair(delivery.pickup)
+    const dropoffCoords = toCoordinatePair(delivery.dropoff)
+
+    for (const trip of activeTrips) {
+      const tripStart = toCoordinatePair(trip.origin)
+      const tripEnd = toCoordinatePair(trip.destination)
+      if (!tripStart || !tripEnd || !pickupCoords || !dropoffCoords) continue
+
+      const pickupDist = distancePointToSegmentMeters(pickupCoords, tripStart, tripEnd)
+      const dropoffDist = distancePointToSegmentMeters(dropoffCoords, tripStart, tripEnd)
+      const detour = computeTripDetourMeters({ tripStart, tripEnd, pickup: pickupCoords, dropoff: dropoffCoords })
+
+      const isOnRoute = Number.isFinite(pickupDist) && Number.isFinite(dropoffDist) &&
+        pickupDist <= DRIVER_MATCH_MAX_ROUTE_CORRIDOR_METERS &&
+        dropoffDist <= DRIVER_MATCH_MAX_ROUTE_CORRIDOR_METERS &&
+        Number.isFinite(detour) && detour <= DRIVER_MATCH_MAX_TRIP_DETOUR_METERS
+
+      if (isOnRoute) {
+        routeScore = 20
+        routeReason = 'Même itinéraire'
+        break
+      }
+
+      // Partial: pickup is on route but dropoff isn't
+      if (Number.isFinite(pickupDist) && pickupDist <= DRIVER_MATCH_MAX_ROUTE_CORRIDOR_METERS) {
+        routeScore = Math.max(routeScore, 10)
+        routeReason = 'Point de ramassage sur votre itinéraire'
+      }
+    }
+  } else {
+    // No active trip — no route to compare, give partial score
+    routeScore = 10
+    routeReason = 'Aucun trajet actif — compatibilité de zone'
+  }
+
+  score += routeScore
+  if (routeReason) reasons.push(routeReason)
+
+  // 5. Proximité du conducteur (bonus — if driver coordinates available)
+  if (driverCoordinates && pickupCoords) {
+    const dist = distanceMeters(
+      [Number(driverCoordinates[0]), Number(driverCoordinates[1])],
+      [Number(pickupCoords[0]), Number(pickupCoords[1])]
+    )
+    if (Number.isFinite(dist) && dist <= DRIVER_MATCH_MAX_PICKUP_DISTANCE_METERS) {
+      // Already included in route score
+    }
+  }
+
+  // Clamp and round
+  score = Math.min(100, Math.round(score))
+
+  return { score, reasons, compatible: true }
+}
+
+/**
+ * Extract a wilaya name from an address string (simple heuristic).
+ */
+const extractWilaya = (address) => {
+  if (!address) return null
+  const parts = address.split(',').map((p) => p.trim()).filter(Boolean)
+  return parts.length >= 2 ? parts[parts.length - 2] : parts[0] || null
 }
 
 export const listDriverTripsForCompatibility = async (connection, driverId) => {

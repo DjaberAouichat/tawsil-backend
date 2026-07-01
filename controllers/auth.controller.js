@@ -737,8 +737,22 @@ export const completeProfile = async (req, res, next) => {
           documentsCount: Array.isArray(documents) ? documents.length : 0,
         }))
       }
+
+      // ── Validate vehicle type against driver type ──
+      const rawVehicleType = (vehicle?.type || req.body.vehicleType || '').trim().toLowerCase()
+      const driverAccountType = req.body.driverType || 'normal_driver'
+      let validatedVehicle = null
+      if (rawVehicleType) {
+        const { validateVehicleType } = await import('../vehicle_capacities.js')
+        const validation = validateVehicleType(rawVehicleType, driverAccountType)
+        if (!validation.valid) {
+          return next(createError(400, validation.error))
+        }
+        validatedVehicle = validation.vehicle
+      }
+
       const vehiclePayload = vehicle || {
-        type: req.body.vehicleType ?? null,
+        type: rawVehicleType || null,
         make: req.body.vehicleMake ?? null,
         model: req.body.vehicleModel ?? null,
         year: req.body.vehicleYear ?? null,
@@ -763,11 +777,24 @@ export const completeProfile = async (req, res, next) => {
           })
         }
 
+        // Store vehicle type and auto-computed capacities on Drivers
+        if (validatedVehicle) {
+          const maxVolumeM3 = validatedVehicle.maxVolumeL ? validatedVehicle.maxVolumeL / 1000 : null
+          const { updateDriverVehicleType } = await import('../models/driver.model.js')
+          await updateDriverVehicleType(connection, {
+            driverId: userId,
+            vehicleType: validatedVehicle.id,
+            maxWeightKg: validatedVehicle.maxWeightKg,
+            maxVolumeM3,
+            maxSizeCategory: validatedVehicle.maxSizeLabel,
+          })
+        }
+
         if (vehiclePayload) {
           await createVehicle(connection, {
             id: crypto.randomUUID(),
             driverId: userId,
-            type: vehiclePayload.type ?? null,
+            type: rawVehicleType || null,
             make: vehiclePayload.make ?? null,
             model: vehiclePayload.model ?? null,
             year: vehiclePayload.year != null ? (Number(vehiclePayload.year) || null) : null,

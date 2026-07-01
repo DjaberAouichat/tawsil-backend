@@ -98,8 +98,10 @@ CREATE TABLE Drivers (
     rating                DECIMAL(3,2) DEFAULT 0.0,
     vehicle_info          TEXT,
     driver_type           ENUM('normal_driver','pro_transporter') NOT NULL DEFAULT 'normal_driver',
+    vehicle_type          VARCHAR(50) DEFAULT NULL,
     max_weight_kg         DECIMAL(10,2) NULL,
     max_volume_m3         DECIMAL(10,4) NULL,
+    max_size_category     VARCHAR(10) DEFAULT NULL,
     FOREIGN KEY (participant_id) REFERENCES Participants(user_id) ON DELETE CASCADE,
     FOREIGN KEY (reviewed_by)   REFERENCES Users(id)             ON DELETE SET NULL
 );
@@ -120,7 +122,7 @@ CREATE TABLE Vehicles (
     license_plate     VARCHAR(20) UNIQUE,
     insurance_number  VARCHAR(50),
     insurance_expiry  DATE,
-    type              ENUM('standard','comfort','premium','van') DEFAULT NULL,
+    type              VARCHAR(50) DEFAULT NULL,
     is_verified       BOOLEAN DEFAULT FALSE,
     FOREIGN KEY (driver_id) REFERENCES Drivers(participant_id) ON DELETE CASCADE
 );
@@ -155,7 +157,7 @@ CREATE TABLE Trips (
     expected_arrival_time DATETIME,
     max_deliveries        INT         DEFAULT 3,
     available_capacity    INT         DEFAULT 3,
-    vehicle_type          ENUM('standard','comfort','premium','van') DEFAULT NULL,
+    vehicle_type          VARCHAR(50) DEFAULT NULL,
     accepted_package_size ENUM('small_only','up_to_medium','up_to_large','any') NOT NULL DEFAULT 'any',
     route_geometry        JSON DEFAULT NULL,
     route_distance_meters INT DEFAULT NULL,
@@ -201,6 +203,8 @@ CREATE TABLE Deliveries (
     capacity_reserved       DECIMAL(10,2) DEFAULT 0,
     is_urgent               BOOLEAN DEFAULT FALSE,
     delivery_mode           VARCHAR(30) DEFAULT 'standard',
+    pickup_wilaya           VARCHAR(100) DEFAULT NULL,
+    dropoff_wilaya          VARCHAR(100) DEFAULT NULL,
     recipient_name          VARCHAR(100),
     recipient_phone         VARCHAR(20),
     delivery_note           TEXT,
@@ -643,6 +647,29 @@ CREATE TABLE DeliveryRatings (
 
 CREATE INDEX idx_delivery_ratings_driver      ON DeliveryRatings(driver_id);
 CREATE INDEX idx_delivery_ratings_delivery    ON DeliveryRatings(delivery_id);
+
+-- ---------------------------------------------------------
+-- ClientRatings (Driver rates Client)
+-- ---------------------------------------------------------
+CREATE TABLE ClientRatings (
+    id                      VARCHAR(36) PRIMARY KEY,
+    delivery_id             VARCHAR(36) NOT NULL UNIQUE,
+    driver_id               VARCHAR(36) NOT NULL,
+    client_id               VARCHAR(36) NOT NULL,
+    communication_rating    TINYINT UNSIGNED NOT NULL CHECK (communication_rating BETWEEN 1 AND 5),
+    flexibility_rating      TINYINT UNSIGNED NOT NULL CHECK (flexibility_rating BETWEEN 1 AND 5),
+    meeting_respect_rating  TINYINT UNSIGNED NOT NULL CHECK (meeting_respect_rating BETWEEN 1 AND 5),
+    average_rating          DECIMAL(3,2) NOT NULL,
+    comment                 TEXT,
+    created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (delivery_id) REFERENCES Deliveries(id) ON DELETE CASCADE,
+    FOREIGN KEY (driver_id)   REFERENCES Drivers(participant_id) ON DELETE CASCADE,
+    FOREIGN KEY (client_id)   REFERENCES Requesters(participant_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_client_ratings_client   ON ClientRatings(client_id);
+CREATE INDEX idx_client_ratings_delivery ON ClientRatings(delivery_id);
 
 -- =========================================================
 -- End of Schema

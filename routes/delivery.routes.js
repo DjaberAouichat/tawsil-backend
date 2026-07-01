@@ -25,6 +25,7 @@ import {
   listDriverAvailableDeliveries,
   listDriverAvailablePackagesByWilaya,
   listDriverDeliveries,
+  listDriverRecommendedDeliveries,
   listUserDeliveries,
   markDeliveryCompleted,
   markPickupCompleted,
@@ -88,6 +89,7 @@ router.get("/driver/current-trip", authorize("driver"), asyncHandler(getDriverCu
 router.get("/driver/mine", authorize("driver"), asyncHandler(listDriverDeliveries))
 router.get("/driver/available", authorize("driver"), validateRequest(driverAvailableDeliveriesQuerySchema), asyncHandler(listDriverAvailableDeliveries))
 router.get("/driver/available-by-wilaya", authorize("driver"), asyncHandler(listDriverAvailablePackagesByWilaya))
+router.get("/driver/recommended", authorize("driver"), asyncHandler(listDriverRecommendedDeliveries))
 router.get("/driver/active", authorize("driver"), asyncHandler(getDriverActiveDelivery))
 router.get("/driver/nearby", authorize("driver"), asyncHandler(getNearbyDeliveries))
 router.post("/driver/location", authorize("driver"), validateRequest(updateDriverLocationSchema), asyncHandler(updateDriverLiveLocation))
